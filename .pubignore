@@ -1,0 +1,19 @@
+# libremidi files not needed at runtime
+third_party/libremidi/tests/
+third_party/libremidi/examples/
+third_party/libremidi/book/
+third_party/libremidi/bindings/
+third_party/libremidi/.git/
+third_party/libremidi/.github/
+third_party/libremidi/.clang-format
+third_party/libremidi/.gitignore
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+build/
+.dart_tool/
+.packages

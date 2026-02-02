@@ -1,0 +1,22 @@
+PODS:
+  - FlutterMacOS (1.0.0)
+  - libremidi_flutter (0.0.1):
+    - FlutterMacOS
+
+DEPENDENCIES:
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - libremidi_flutter (from `Flutter/ephemeral/.symlinks/plugins/libremidi_flutter/macos`)
+
+EXTERNAL SOURCES:
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  libremidi_flutter:
+    :path: Flutter/ephemeral/.symlinks/plugins/libremidi_flutter/macos
+
+SPEC CHECKSUMS:
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  libremidi_flutter: 398240d140dc43e5b7089b89de2df04b8a411435
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.16.2

@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!-- MIDI permissions -->
+  <uses-feature android:name="android.software.midi" android:required="false" />
+
+  <!-- Bluetooth MIDI (optional) -->
+  <uses-permission android:name="android.permission.BLUETOOTH" />
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+</manifest>

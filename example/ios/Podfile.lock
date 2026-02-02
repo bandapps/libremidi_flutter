@@ -1,0 +1,22 @@
+PODS:
+  - Flutter (1.0.0)
+  - libremidi_flutter (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - libremidi_flutter (from `.symlinks/plugins/libremidi_flutter/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  libremidi_flutter:
+    :path: ".symlinks/plugins/libremidi_flutter/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  libremidi_flutter: 4cbb126069c0ceb156e7e5b461fcd8c2d994d99e
+
+PODFILE CHECKSUM: 3c63482e143d1b91d2d2560aee9fb04ecc74ac7e
+
+COCOAPODS: 1.16.2
