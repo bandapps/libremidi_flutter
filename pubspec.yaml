@@ -1,6 +1,6 @@
 name: libremidi_flutter
 description: "Cross-platform MIDI device access for Flutter. Supports macOS, iOS, Android, Windows, and Linux with hotplug detection."
-version: 0.8.1
+version: 0.8.2
 repository: https://github.com/bandapps/libremidi_flutter
 issue_tracker: https://github.com/bandapps/libremidi_flutter/issues
 topics:

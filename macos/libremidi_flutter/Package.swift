@@ -14,11 +14,12 @@ let package = Package(
         .target(
             name: "libremidi_flutter",
             dependencies: [],
+            sources: ["libremidi_flutter.cpp"],
             cxxSettings: [
                 .define("LIBREMIDI_HEADER_ONLY", to: "1"),
                 .define("LIBREMIDI_COREMIDI", to: "1"),
-                .headerSearchPath("../../../../../third_party/libremidi/include"),
-                .headerSearchPath("../../../../../src"),
+                .headerSearchPath("include/libremidi_flutter"),
+                .headerSearchPath("libremidi_headers"),
                 .unsafeFlags(["-std=c++20"])
             ],
             linkerSettings: [

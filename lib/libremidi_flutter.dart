@@ -19,7 +19,12 @@ const String _libName = 'libremidi_flutter';
 
 final DynamicLibrary _dylib = () {
   if (Platform.isMacOS || Platform.isIOS) {
-    return DynamicLibrary.open('$_libName.framework/$_libName');
+    try {
+      return DynamicLibrary.open('$_libName.framework/$_libName');
+    } catch (_) {
+      // SPM statically links the library into the process.
+      return DynamicLibrary.process();
+    }
   }
   if (Platform.isAndroid || Platform.isLinux) {
     return DynamicLibrary.open('lib$_libName.so');
@@ -536,6 +541,13 @@ class MidiOutput {
       throw const MidiException('Failed to open MIDI output');
     }
   }
+
+  /// The raw native pointer address for cross-plugin bridging.
+  ///
+  /// Use with `Pointer<LrmMidiOut>.fromAddress(address)` in another
+  /// FFI plugin that shares the same [LrmMidiOut] struct layout.
+  /// Returns 0 if disposed.
+  int get handleAddress => _disposed ? 0 : (_handle?.address ?? 0);
 
   void _checkDisposed() {
     if (_disposed) {

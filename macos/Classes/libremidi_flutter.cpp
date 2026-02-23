@@ -202,11 +202,24 @@ struct LrmMidiIn {
 
 struct LrmMidiOut {
     std::unique_ptr<libremidi::midi_out> midi_out;
+    int64_t port_id{0};
 
-    LrmMidiOut(libremidi::output_port& port) {
+    LrmMidiOut() = default;
+
+    LrmMidiOut(libremidi::output_port& port)
+        : port_id(static_cast<int64_t>(static_cast<int32_t>(port.port)))
+    {
         midi_out = std::make_unique<libremidi::midi_out>();
         midi_out->open_port(port);
     }
+
+    virtual void sendRaw(const uint8_t* data, size_t len) {
+        if (midi_out) {
+            try { midi_out->send_message(data, len); } catch (...) {}
+        }
+    }
+
+    virtual ~LrmMidiOut() = default;
 };
 
 // =============================================================================
