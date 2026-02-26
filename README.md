@@ -19,7 +19,7 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 
 ```yaml
 dependencies:
-  libremidi_flutter: ^0.8.1
+  libremidi_flutter: ^0.8.2
 ```
 
 ## Usage
