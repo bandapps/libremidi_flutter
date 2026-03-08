@@ -504,9 +504,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
               (i) => DropdownMenuItem(
                 value: i,
                 child: Text(
-                  device.outputPorts[i].displayName.isNotEmpty
-                      ? device.outputPorts[i].displayName
-                      : 'Port ${i + 1}',
+                  'Port ${i + 1}',
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -538,9 +536,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
               (i) => DropdownMenuItem(
                 value: i,
                 child: Text(
-                  device.inputPorts[i].displayName.isNotEmpty
-                      ? device.inputPorts[i].displayName
-                      : 'Port ${i + 1}',
+                  'Port ${i + 1}',
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
