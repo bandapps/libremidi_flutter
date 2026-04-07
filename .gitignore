@@ -30,4 +30,19 @@ migrate_working_dir/
 .dart_tool/
 .flutter-plugins-dependencies
 /build/
+**/build/
+!third_party/winmidi_sdk/build/
+!third_party/winmidi_sdk/build/native/
+!third_party/winmidi_sdk/build/native/include/
+!third_party/winmidi_sdk/build/native/include/winmidi/
+!third_party/winmidi_sdk/build/native/include/winmidi/**
+**/.gradle/
+**/.cxx/
 /coverage/
+
+# Vendored libremidi content not needed to build this Flutter plugin.
+third_party/libremidi/tests/
+third_party/libremidi/examples/
+third_party/libremidi/book/
+third_party/libremidi/bindings/
+third_party/libremidi/.github/

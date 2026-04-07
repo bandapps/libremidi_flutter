@@ -1,7 +1,7 @@
 #include "libremidi_flutter.h"
 
 // Library version
-#define LRM_VERSION "1.0.0"
+#define LRM_VERSION "0.8.3"
 
 // Enable header-only mode
 #define LIBREMIDI_HEADER_ONLY 1
@@ -10,7 +10,11 @@
 #if defined(__APPLE__)
   #define LIBREMIDI_COREMIDI 1
 #elif defined(_WIN32)
-  #define LIBREMIDI_WINUWP 1
+  #if defined(LIBREMIDI_WINMIDI)
+    // LIBREMIDI_WINMIDI already defined by CMake — WinMIDI + WinUWP fallback
+  #else
+    #define LIBREMIDI_WINUWP 1
+  #endif
 #elif defined(__ANDROID__)
   #define LIBREMIDI_ANDROID 1
 #elif defined(__linux__)
@@ -22,18 +26,62 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <algorithm>
 #include <string>
 #include <vector>
 
 // =============================================================================
+// API selection — prefer WinMIDI (MIDI 2.0), fall back to platform default
+// =============================================================================
+
+static libremidi::API get_preferred_api() {
+#if defined(LIBREMIDI_WINMIDI)
+    // WinMIDI checks at construction time whether the Windows MIDI Service
+    // is installed, running, and reachable via COM. If all checks pass,
+    // winmidi::backend::available() returns true.
+    if (libremidi::winmidi::backend::available()) {
+        return libremidi::API::WINDOWS_MIDI_SERVICES;
+    }
+    // Service not present — fall back to WinUWP.
+    return libremidi::API::WINDOWS_UWP;
+#else
+    return libremidi::midi1::default_api();
+#endif
+}
+
+// =============================================================================
 // Internal structures using Generic API
 // =============================================================================
+
+static constexpr const char* kInternalClientName = "libremidi_flutter_internal";
 
 // Event types for hotplug callback
 #define LRM_EVENT_INPUT_ADDED    0
 #define LRM_EVENT_INPUT_REMOVED  1
 #define LRM_EVENT_OUTPUT_ADDED   2
 #define LRM_EVENT_OUTPUT_REMOVED 3
+
+// FNV-1a 64-bit hash for stable_id / public port id generation
+static uint64_t fnv1a_hash(const std::string& str) {
+    uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+    for (char c : str) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ULL; // FNV prime
+    }
+    return hash;
+}
+
+template<typename PortType>
+static uint64_t public_port_id(const PortType& port) {
+    // WinRT and WinMIDI ports use string-based device IDs, not numeric.
+    // Hash port_name for a stable uint64_t identifier across the FFI boundary.
+    if (port.api == libremidi::API::WINDOWS_UWP
+        || port.api == libremidi::API::WINDOWS_MIDI_SERVICES) {
+        return fnv1a_hash(port.port_name);
+    }
+
+    return static_cast<uint64_t>(port.port);
+}
 
 struct LrmObserver {
     std::unique_ptr<libremidi::observer> observer;
@@ -71,21 +119,63 @@ struct LrmObserver {
             };
         }
 
-        // Use the default API for the platform with proper configuration
-        auto api = libremidi::midi1::default_api();
+        // WinMIDI if available, otherwise platform default (WinUWP, CoreMIDI, ALSA...)
+        auto api = get_preferred_api();
+        auto api_conf = libremidi::observer_configuration_for(api);
+        libremidi::set_client_name(api_conf, kInternalClientName);
         observer = std::make_unique<libremidi::observer>(
             std::move(config),
-            libremidi::observer_configuration_for(api)
+            std::move(api_conf)
         );
         refreshInternal();
     }
 
     ~LrmObserver() = default;
 
+    template <typename PortType>
+    static bool isInternalObserverPort(const PortType& port) {
+        if (port.type != libremidi::transport_type::software &&
+            port.type != libremidi::transport_type::loopback) {
+            return false;
+        }
+
+        auto lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return s;
+        };
+
+        const auto device = lower(port.device_name);
+        const auto display = lower(port.display_name);
+        const auto port_name = lower(port.port_name);
+
+        // Hide only our own libremidi infrastructure from the public device
+        // list. The ALSA observer port can surface separately under its port
+        // name, while backends with client_name support use our stable name.
+        return device == kInternalClientName ||
+               display == "libremidi-observe" ||
+               port_name == "libremidi-observe";
+    }
+
     void refreshInternal() {
         if (observer) {
             auto new_inputs = observer->get_input_ports();
             auto new_outputs = observer->get_output_ports();
+
+            new_inputs.erase(
+                std::remove_if(
+                    new_inputs.begin(),
+                    new_inputs.end(),
+                    [](const auto& port) { return isInternalObserverPort(port); }),
+                new_inputs.end());
+            new_outputs.erase(
+                std::remove_if(
+                    new_outputs.begin(),
+                    new_outputs.end(),
+                    [](const auto& port) { return isInternalObserverPort(port); }),
+                new_outputs.end());
+
             std::lock_guard<std::mutex> lock(ports_mutex);
             input_ports = std::move(new_inputs);
             output_ports = std::move(new_outputs);
@@ -120,6 +210,28 @@ struct LrmObserver {
         return true;
     }
 
+    bool getInputPortById(uint64_t port_id, libremidi::input_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        for (const auto& p : input_ports) {
+            if (public_port_id(p) == port_id) {
+                port = p;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool getOutputPortById(uint64_t port_id, libremidi::output_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        for (const auto& p : output_ports) {
+            if (public_port_id(p) == port_id) {
+                port = p;
+                return true;
+            }
+        }
+        return false;
+    }
+
     void notifyHotplug(int eventType) {
         if (hotplug_callback) {
             hotplug_callback(hotplug_context, eventType);
@@ -147,11 +259,14 @@ struct LrmMidiIn {
             }
         };
 
-        // Use the default API for the platform with proper configuration
-        auto api = libremidi::midi1::default_api();
+        // Use the API that enumerated this port. For MIDI 2 backends
+        // (WinMIDI), libremidi wraps the MIDI 1 config with UMP conversion.
+        auto api = port.api;
+        auto api_conf = libremidi::midi_in_configuration_for(api);
+        libremidi::set_client_name(api_conf, kInternalClientName);
         midi_in = std::make_unique<libremidi::midi_in>(
             std::move(config),
-            libremidi::midi_in_configuration_for(api)
+            std::move(api_conf)
         );
         midi_in->open_port(port);
     }
@@ -161,11 +276,14 @@ struct LrmMidiOut {
     std::unique_ptr<libremidi::midi_out> midi_out;
 
     LrmMidiOut(libremidi::output_port port) {
-        // Use the default API for the platform with proper configuration
-        auto api = libremidi::midi1::default_api();
+        // Use the API that enumerated this port. For MIDI 2 backends
+        // (WinMIDI), libremidi converts MIDI 1 send_message() to UMP.
+        auto api = port.api;
+        auto api_conf = libremidi::midi_out_configuration_for(api);
+        libremidi::set_client_name(api_conf, kInternalClientName);
         midi_out = std::make_unique<libremidi::midi_out>(
             libremidi::output_configuration{},
-            libremidi::midi_out_configuration_for(api)
+            std::move(api_conf)
         );
         midi_out->open_port(port);
     }
@@ -227,16 +345,6 @@ static void safe_strcpy(char* dest, size_t dest_size, const std::string& src) {
     dest[dest_size - 1] = '\0';
 }
 
-// FNV-1a 64-bit hash for stable_id generation
-static uint64_t fnv1a_hash(const std::string& str) {
-    uint64_t hash = 14695981039346656037ULL; // FNV offset basis
-    for (char c : str) {
-        hash ^= static_cast<uint64_t>(c);
-        hash *= 1099511628211ULL; // FNV prime
-    }
-    return hash;
-}
-
 // Generate stable port key for cross-platform identification
 template<typename PortType>
 static std::string port_key(const PortType& port) {
@@ -250,7 +358,7 @@ static void fill_port_info(const PortType& port, int32_t index, bool is_input, L
     std::memset(info, 0, sizeof(LrmPortInfo));
 
     // Identifiers
-    info->port_id = static_cast<uint64_t>(port.port);
+    info->port_id = public_port_id(port);
     info->client_handle = static_cast<uint64_t>(port.client);
     info->index = index;
 
@@ -319,6 +427,21 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer
     }
 }
 
+extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* observer, uint64_t port_id) {
+    if (!observer) return nullptr;
+
+    libremidi::output_port port;
+    if (!observer->getOutputPortById(port_id, port)) {
+        return nullptr;
+    }
+
+    try {
+        return new LrmMidiOut(port);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 extern "C" FFI_PLUGIN_EXPORT void lrm_midi_out_close(LrmMidiOut* midi_out) {
     delete midi_out;
 }
@@ -357,6 +480,30 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open(
 
     libremidi::input_port port;
     if (!observer->getInputPort(static_cast<size_t>(port_index), port)) {
+        return nullptr;
+    }
+
+    try {
+        return new LrmMidiIn(port, callback, context,
+                            receive_sysex, receive_timing, receive_sensing);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmMidiCallback callback,
+    void* context,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+) {
+    if (!observer) return nullptr;
+
+    libremidi::input_port port;
+    if (!observer->getInputPortById(port_id, port)) {
         return nullptr;
     }
 

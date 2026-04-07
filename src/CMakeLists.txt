@@ -43,20 +43,105 @@ if(APPLE)
 endif()
 
 if(WIN32)
-  # Windows: Enable WinUWP (WinRT MIDI) backend with cfgmgr32 for device info
-  target_compile_definitions(libremidi_flutter PRIVATE
-    LIBREMIDI_WINUWP=1
-    # Explicitly disable other backends
-    LIBREMIDI_NO_WINMM=1
-    LIBREMIDI_NO_ALSA=1
-    LIBREMIDI_NO_JACK=1
-    LIBREMIDI_NO_PIPEWIRE=1
-    LIBREMIDI_NO_COREMIDI=1
-    LIBREMIDI_NO_ANDROID=1
-  )
+  # Windows MIDI Services (WinMIDI) — primary backend.
+  # Falls back to WinUWP at runtime if the service is unavailable.
+  # The minimal WinMIDI SDK artifacts are vendored under third_party/winmidi_sdk.
+  set(WINMIDI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/winmidi_sdk")
+  set(CPPWINRT_OUTDIR "${CMAKE_BINARY_DIR}/cppwinrt-winmidi")
 
-  # Link windowsapp (WinRT) and cfgmgr32 (for extended device info)
-  target_link_libraries(libremidi_flutter PRIVATE windowsapp cfgmgr32)
+  if(EXISTS "${WINMIDI_DIR}/ref/native/Microsoft.Windows.Devices.Midi2.winmd"
+     AND EXISTS "${WINMIDI_DIR}/build/native/include/winmidi")
+    set(WINMIDI_AVAILABLE TRUE)
+  else()
+    message(WARNING "libremidi_flutter: bundled WinMIDI SDK artifacts not found — using WinUWP only.")
+    set(WINMIDI_AVAILABLE FALSE)
+  endif()
+
+  if(WINMIDI_AVAILABLE)
+    file(GLOB _cppwinrt_candidates
+      "C:/Program Files (x86)/Windows Kits/10/bin/*/x64/cppwinrt.exe"
+    )
+    if(_cppwinrt_candidates)
+      list(SORT _cppwinrt_candidates)
+      list(GET _cppwinrt_candidates -1 CPPWINRT_TOOL)
+    endif()
+
+    if(CPPWINRT_TOOL)
+      message(STATUS "libremidi_flutter: using cppwinrt at ${CPPWINRT_TOOL}")
+
+      set(_winsdk_base "C:/Program Files (x86)/Windows Kits/10/References")
+      file(GLOB _winsdk_versions "${_winsdk_base}/*")
+      if(_winsdk_versions)
+        list(SORT _winsdk_versions)
+        list(GET _winsdk_versions -1 _winsdk_refs)
+      endif()
+      file(GLOB _winmds "${_winsdk_refs}/*/*/*.winmd")
+
+      set(_rsp "")
+      string(APPEND _rsp
+        "-input \"${WINMIDI_DIR}/ref/native/Microsoft.Windows.Devices.Midi2.winmd\"\n")
+      foreach(_wm IN LISTS _winmds)
+        string(APPEND _rsp "-ref \"${_wm}\"\n")
+      endforeach()
+      file(WRITE "${CMAKE_BINARY_DIR}/cppwinrt-winmidi.rsp" "${_rsp}")
+
+      file(REMOVE_RECURSE "${CPPWINRT_OUTDIR}")
+      execute_process(
+        COMMAND "${CPPWINRT_TOOL}"
+          "@${CMAKE_BINARY_DIR}/cppwinrt-winmidi.rsp"
+          -output "${CPPWINRT_OUTDIR}"
+        RESULT_VARIABLE _cppwinrt_result
+      )
+
+      if(_cppwinrt_result EQUAL 0)
+        if(EXISTS "${WINMIDI_DIR}/build/native/include/winmidi/WindowsMidiServicesAppSdkComExtensions.h")
+          file(COPY
+            "${WINMIDI_DIR}/build/native/include/winmidi/init"
+            "${WINMIDI_DIR}/build/native/include/winmidi/WindowsMidiServicesAppSdkComExtensions.h"
+            DESTINATION "${CPPWINRT_OUTDIR}/")
+        endif()
+        message(STATUS "libremidi_flutter: WinMIDI C++ projections generated successfully")
+      else()
+        message(WARNING "libremidi_flutter: cppwinrt failed (${_cppwinrt_result}). Falling back to pre-packaged headers.")
+        file(COPY "${WINMIDI_DIR}/build/native/include/winmidi"
+             DESTINATION "${CPPWINRT_OUTDIR}/")
+      endif()
+    else()
+      message(STATUS "libremidi_flutter: cppwinrt not found — using pre-packaged WinMIDI headers")
+      file(COPY "${WINMIDI_DIR}/build/native/include/winmidi"
+           DESTINATION "${CPPWINRT_OUTDIR}/")
+    endif()
+
+    target_include_directories(libremidi_flutter PRIVATE
+      "${CPPWINRT_OUTDIR}"
+    )
+  endif()
+
+  if(WINMIDI_AVAILABLE)
+    target_compile_definitions(libremidi_flutter PRIVATE
+      LIBREMIDI_WINMIDI=1
+      LIBREMIDI_WINUWP=1
+      LIBREMIDI_NO_WINMM=1
+      LIBREMIDI_NO_ALSA=1
+      LIBREMIDI_NO_JACK=1
+      LIBREMIDI_NO_PIPEWIRE=1
+      LIBREMIDI_NO_COREMIDI=1
+      LIBREMIDI_NO_ANDROID=1
+    )
+  else()
+    target_compile_definitions(libremidi_flutter PRIVATE
+      LIBREMIDI_WINUWP=1
+      LIBREMIDI_NO_WINMM=1
+      LIBREMIDI_NO_ALSA=1
+      LIBREMIDI_NO_JACK=1
+      LIBREMIDI_NO_PIPEWIRE=1
+      LIBREMIDI_NO_COREMIDI=1
+      LIBREMIDI_NO_ANDROID=1
+    )
+  endif()
+
+  # Link WinRT, cfgmgr32 (device info), RuntimeObject
+  target_link_libraries(libremidi_flutter PRIVATE windowsapp cfgmgr32 RuntimeObject)
 endif()
 
 if(UNIX AND NOT APPLE AND NOT ANDROID)

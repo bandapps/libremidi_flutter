@@ -1,7 +1,7 @@
 // iOS implementation - same as macOS (both use CoreMIDI)
 // Uses MIDIClientCreateWithBlock for hotplug notifications (GCD-based, works with Flutter)
 
-#include "../../src/libremidi_flutter.h"
+#include "libremidi_flutter.h"
 
 // Enable header-only mode and CoreMIDI backend
 #define LIBREMIDI_HEADER_ONLY 1
@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,7 @@
 #define LRM_EVENT_INPUT_REMOVED  1
 #define LRM_EVENT_OUTPUT_ADDED   2
 #define LRM_EVENT_OUTPUT_REMOVED 3
+#define LRM_EVENT_SETUP_CHANGED  4
 
 // Forward declaration
 struct LrmObserver;
@@ -44,9 +46,12 @@ struct LrmObserver {
     LrmHotplugCallback hotplug_callback;
     void* hotplug_context;
     MIDIClientRef midiClient;
+    dispatch_queue_t refreshQueue;
+    mutable std::mutex ports_mutex;
 
     LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
         : hotplug_callback(callback), hotplug_context(context), midiClient(0)
+        , refreshQueue(dispatch_queue_create("dev.celtera.libremidi.refresh", DISPATCH_QUEUE_SERIAL))
     {
         printf("[libremidi] Creating observer, callback=%p\n", (void*)callback);
 
@@ -89,17 +94,70 @@ struct LrmObserver {
             MIDIClientDispose(midiClient);
             midiClient = 0;
         }
+        // Drain pending blocks before freeing — prevents use-after-free
+        // if a hotplug notification was dispatched just before dispose.
+        dispatch_sync(refreshQueue, ^{});
+    }
+
+    /// Refresh + notify on a background queue to avoid blocking the main
+    /// thread (CoreMIDI delivers notifications on the main RunLoop).
+    void refreshAndNotifyAsync(int eventType) {
+        dispatch_async(refreshQueue, ^{
+            refreshInternal();
+            notifyHotplug(eventType);
+        });
     }
 
     void refreshInternal() {
         if (observer) {
-            input_ports = observer->get_input_ports();
-            output_ports = observer->get_output_ports();
+            // Enumerate without holding the lock to avoid deadlock with
+            // CoreMIDI's internal locks during notification handling.
+            auto new_inputs = observer->get_input_ports();
+            auto new_outputs = observer->get_output_ports();
+            std::lock_guard<std::mutex> lock(ports_mutex);
+            input_ports = std::move(new_inputs);
+            output_ports = std::move(new_outputs);
         }
     }
 
     void refresh() {
         refreshInternal();
+    }
+
+    bool getInputPort(size_t index, libremidi::input_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        if (index >= input_ports.size()) return false;
+        port = input_ports[index];
+        return true;
+    }
+
+    bool getOutputPort(size_t index, libremidi::output_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        if (index >= output_ports.size()) return false;
+        port = output_ports[index];
+        return true;
+    }
+
+    bool getInputPortById(uint64_t port_id, libremidi::input_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        for (const auto& p : input_ports) {
+            if (static_cast<uint64_t>(p.port) == port_id) {
+                port = p;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool getOutputPortById(uint64_t port_id, libremidi::output_port& port) const {
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        for (const auto& p : output_ports) {
+            if (static_cast<uint64_t>(p.port) == port_id) {
+                port = p;
+                return true;
+            }
+        }
+        return false;
     }
 
     void notifyHotplug(int eventType) {
@@ -110,21 +168,20 @@ struct LrmObserver {
 };
 
 static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification) {
-    printf("[libremidi] MIDI notification: messageID=%d\n", (int)notification->messageID);
+    // CoreMIDI delivers notifications on the main thread RunLoop.
+    // We must not call get_input_ports()/get_output_ports() here because
+    // they re-enter the RunLoop, causing a deadlock with Flutter.
+    // Instead, dispatch refresh + notify to a background serial queue.
 
     switch (notification->messageID) {
         case kMIDIMsgObjectAdded: {
             const MIDIObjectAddRemoveNotification* addRemove =
                 (const MIDIObjectAddRemoveNotification*)notification;
 
-            obs->refreshInternal();
-
             if (addRemove->childType == kMIDIObjectType_Source) {
-                printf("[libremidi] Input added\n");
-                obs->notifyHotplug(LRM_EVENT_INPUT_ADDED);
+                obs->refreshAndNotifyAsync(LRM_EVENT_INPUT_ADDED);
             } else if (addRemove->childType == kMIDIObjectType_Destination) {
-                printf("[libremidi] Output added\n");
-                obs->notifyHotplug(LRM_EVENT_OUTPUT_ADDED);
+                obs->refreshAndNotifyAsync(LRM_EVENT_OUTPUT_ADDED);
             }
             break;
         }
@@ -132,25 +189,15 @@ static void handleMIDINotification(LrmObserver* obs, const MIDINotification* not
             const MIDIObjectAddRemoveNotification* addRemove =
                 (const MIDIObjectAddRemoveNotification*)notification;
 
-            obs->refreshInternal();
-
             if (addRemove->childType == kMIDIObjectType_Source) {
-                printf("[libremidi] Input removed\n");
-                obs->notifyHotplug(LRM_EVENT_INPUT_REMOVED);
+                obs->refreshAndNotifyAsync(LRM_EVENT_INPUT_REMOVED);
             } else if (addRemove->childType == kMIDIObjectType_Destination) {
-                printf("[libremidi] Output removed\n");
-                obs->notifyHotplug(LRM_EVENT_OUTPUT_REMOVED);
+                obs->refreshAndNotifyAsync(LRM_EVENT_OUTPUT_REMOVED);
             }
             break;
         }
         case kMIDIMsgSetupChanged:
-            // iOS often sends SetupChanged instead of ObjectAdded/Removed
-            // (especially for BLE MIDI devices). Notify both input and output
-            // so Dart UI refreshes the device list.
-            printf("[libremidi] MIDI setup changed\n");
-            obs->refreshInternal();
-            obs->notifyHotplug(LRM_EVENT_INPUT_ADDED);
-            obs->notifyHotplug(LRM_EVENT_OUTPUT_ADDED);
+            obs->refreshAndNotifyAsync(LRM_EVENT_SETUP_CHANGED);
             break;
         default:
             break;
@@ -195,7 +242,7 @@ struct LrmMidiOut {
 // =============================================================================
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
-    return "0.0.1";
+    return "0.8.3";
 }
 
 // =============================================================================
@@ -232,11 +279,13 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_observer_refresh(LrmObserver* observer) {
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input_count(LrmObserver* observer) {
     if (!observer) return 0;
+    std::lock_guard<std::mutex> lock(observer->ports_mutex);
     return static_cast<int32_t>(observer->input_ports.size());
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output_count(LrmObserver* observer) {
     if (!observer) return 0;
+    std::lock_guard<std::mutex> lock(observer->ports_mutex);
     return static_cast<int32_t>(observer->output_ports.size());
 }
 
@@ -294,21 +343,27 @@ static void fill_port_info(const PortType& port, int32_t index, bool is_input, L
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input(LrmObserver* observer, int32_t index, LrmPortInfo* info) {
     if (!observer || !info) return LRM_ERR_INVALID;
-    if (index < 0 || index >= static_cast<int32_t>(observer->input_ports.size())) {
+    if (index < 0) return LRM_ERR_NOT_FOUND;
+
+    libremidi::input_port port;
+    if (!observer->getInputPort(static_cast<size_t>(index), port)) {
         return LRM_ERR_NOT_FOUND;
     }
 
-    fill_port_info(observer->input_ports[index], index, true, info);
+    fill_port_info(port, index, true, info);
     return LRM_OK;
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observer, int32_t index, LrmPortInfo* info) {
     if (!observer || !info) return LRM_ERR_INVALID;
-    if (index < 0 || index >= static_cast<int32_t>(observer->output_ports.size())) {
+    if (index < 0) return LRM_ERR_NOT_FOUND;
+
+    libremidi::output_port port;
+    if (!observer->getOutputPort(static_cast<size_t>(index), port)) {
         return LRM_ERR_NOT_FOUND;
     }
 
-    fill_port_info(observer->output_ports[index], index, false, info);
+    fill_port_info(port, index, false, info);
     return LRM_OK;
 }
 
@@ -318,12 +373,30 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observ
 
 extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer, int32_t port_index) {
     if (!observer) return nullptr;
-    if (port_index < 0 || port_index >= static_cast<int32_t>(observer->output_ports.size())) {
+    if (port_index < 0) return nullptr;
+
+    libremidi::output_port port;
+    if (!observer->getOutputPort(static_cast<size_t>(port_index), port)) {
         return nullptr;
     }
 
     try {
-        return new LrmMidiOut(observer->output_ports[port_index]);
+        return new LrmMidiOut(port);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* observer, uint64_t port_id) {
+    if (!observer) return nullptr;
+
+    libremidi::output_port port;
+    if (!observer->getOutputPortById(port_id, port)) {
+        return nullptr;
+    }
+
+    try {
+        return new LrmMidiOut(port);
     } catch (...) {
         return nullptr;
     }
@@ -363,12 +436,39 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open(
     bool receive_sensing
 ) {
     if (!observer) return nullptr;
-    if (port_index < 0 || port_index >= static_cast<int32_t>(observer->input_ports.size())) {
+    if (port_index < 0) return nullptr;
+
+    libremidi::input_port port;
+    if (!observer->getInputPort(static_cast<size_t>(port_index), port)) {
         return nullptr;
     }
 
     try {
-        return new LrmMidiIn(observer->input_ports[port_index], callback, context,
+        return new LrmMidiIn(port, callback, context,
+                            receive_sysex, receive_timing, receive_sensing);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmMidiCallback callback,
+    void* context,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+) {
+    if (!observer) return nullptr;
+
+    libremidi::input_port port;
+    if (!observer->getInputPortById(port_id, port)) {
+        return nullptr;
+    }
+
+    try {
+        return new LrmMidiIn(port, callback, context,
                             receive_sysex, receive_timing, receive_sensing);
     } catch (...) {
         return nullptr;

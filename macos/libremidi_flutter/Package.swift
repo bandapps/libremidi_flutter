@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "libremidi_flutter",
     platforms: [
-        .macOS(.v10_14)
+        .macOS(.v10_15)
     ],
     products: [
         .library(name: "libremidi-flutter", targets: ["libremidi_flutter"])
@@ -14,7 +14,9 @@ let package = Package(
         .target(
             name: "libremidi_flutter",
             dependencies: [],
+            path: "Sources/libremidi_flutter",
             sources: ["libremidi_flutter.cpp"],
+            publicHeadersPath: "include/libremidi_flutter",
             cxxSettings: [
                 .define("LIBREMIDI_HEADER_ONLY", to: "1"),
                 .define("LIBREMIDI_COREMIDI", to: "1"),

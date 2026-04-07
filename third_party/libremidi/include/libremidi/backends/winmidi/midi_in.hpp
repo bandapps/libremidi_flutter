@@ -100,7 +100,7 @@ public:
     if (!ep || !gp)
       return std::errc::address_not_available;
 
-    m_group_filter = port.port - 1;
+    m_group_filter = gp.FirstGroup().Index();
 
     // TODO use a MidiGroupEndpointListener for the filtering
     m_endpoint = m_session.CreateEndpointConnection(ep.EndpointDeviceId());

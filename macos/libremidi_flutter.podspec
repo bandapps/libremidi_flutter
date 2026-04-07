@@ -4,14 +4,14 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'libremidi_flutter'
-  s.version          = '0.0.1'
+  s.version          = '0.8.3'
   s.summary          = 'Cross-platform MIDI device access for Flutter using libremidi.'
   s.description      = <<-DESC
 A Flutter plugin providing MIDI device listing, connection, and communication
 using the libremidi library via FFI.
                        DESC
   s.homepage         = 'https://github.com/bandapps/libremidi_flutter'
-  s.license          = { :file => '../LICENSE' }
+  s.license          = { :type => 'BSD-2-Clause', :file => '../LICENSE' }
   s.author           = { 'bandapps' => 'info@bandapps.de' }
 
   s.source           = { :path => '.' }
@@ -23,7 +23,7 @@ using the libremidi library via FFI.
     '../third_party/libremidi/include/**/*.{hpp,h}'
   ]
 
-  s.public_header_files = 'Classes/**/*.h'
+  # No public headers - this is an FFI plugin (all symbols accessed via dart:ffi)
 
   # Include paths
   s.xcconfig = {
@@ -41,6 +41,6 @@ using the libremidi library via FFI.
 
   s.dependency 'FlutterMacOS'
 
-  s.platform = :osx, '10.14'
+  s.platform = :osx, '10.15'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
 end

@@ -112,7 +112,7 @@ public:
          .serial = to_string(tinfo.SerialNumber),
          .device_name = to_string(p.Name()),
          .port_name = to_string(gp.Name()),
-         .display_name = to_string(gp.Name()) + " " + std::to_string(gp.Number()),
+         .display_name = to_string(gp.Name()),
          .type = code_to_type(to_string(p.GetTransportSuppliedInfo().TransportCode))}};
   }
 

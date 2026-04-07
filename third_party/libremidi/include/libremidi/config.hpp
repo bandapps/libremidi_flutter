@@ -1,6 +1,6 @@
 #pragma once
 
-#define LIBREMIDI_VERSION "5.4.2"
+#define LIBREMIDI_VERSION "5.4.3"
 
 // clang-format off
 #if !defined(LIBREMIDI_BASE_NAMESPACE)
@@ -93,6 +93,7 @@ using midi_bytes = std::vector<unsigned char>;
 #endif
 
 // Use boost::variant2 if available
+#define LIBREMIDI_NO_BOOST_VARIANT2 1
 #if __has_include(<boost/variant2.hpp>) && !defined(LIBREMIDI_NO_BOOST_VARIANT2)
   #include <boost/variant2.hpp>
   #define LIBREMIDI_VARIANT_IS_BOOST_VARIANT2

@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
+
+import 'midi_access.dart';
 
 /// MIDI demo with hotplug
 
@@ -17,39 +18,13 @@ void main() {
   );
 }
 
-/// Groups input/output ports into a single device.
-class MidiDevice {
-  final String name;
-  final List<MidiPort> inputPorts = [];
-  final List<MidiPort> outputPorts = [];
-  String? manufacturer;
-  MidiTransportType? transportType;
-  int? _stableId;
-
-  MidiDevice(this.name);
-
-  int get inputCount => inputPorts.length;
-  int get outputCount => outputPorts.length;
-
-  /// Stable ID based on all port IDs + name (survives hotplug).
-  int get stableId {
-    if (_stableId != null) return _stableId!;
-    var hash = name.hashCode;
-    for (final port in inputPorts) {
-      hash = hash ^ (port.effectiveStableId * 31);
-    }
-    for (final port in outputPorts) {
-      hash = hash ^ (port.effectiveStableId * 37);
-    }
-    _stableId = hash;
-    return _stableId!;
-  }
-
-  String get transportName => transportType?.name ?? '';
-}
-
 class MidiDemoPage extends StatefulWidget {
-  const MidiDemoPage({super.key});
+  const MidiDemoPage({
+    super.key,
+    this.midiAccess = const LibremidiMidiAccess(),
+  });
+
+  final MidiAccess midiAccess;
 
   @override
   State<MidiDemoPage> createState() => _MidiDemoPageState();
@@ -59,21 +34,27 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   List<MidiDevice> _devices = [];
   MidiDevice? _selectedDevice;
   bool _deviceConnected = false;
-  MidiInput? _midiInput;
-  MidiOutput? _midiOutput;
+  MidiInputConnection? _midiInput;
+  MidiOutputConnection? _midiOutput;
+  StreamSubscription<HotplugEventType>? _hotplugSubscription;
+  StreamSubscription<MidiMessage>? _midiInputSubscription;
 
   // Multi-port: selected port indices
   int _selectedInputIndex = 0;
   int _selectedOutputIndex = 0;
 
   // MIDI values
-  int _channel = 0;
+  int? _inputChannel;
+  int _outputChannel = 0;
   int _cc = 1;
   int _ccValue = 64;
   int _bank = 0;
   int _pc = 0;
   int _note = 60;
   int _velocity = 100;
+  int _pitchBend = 8192;
+  int _aftertouchPressure = 64;
+  int _polyAftertouchPressure = 64;
 
   String _midiFunction = 'CC';
 
@@ -96,48 +77,42 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   // Debounce for port reconnection
   Timer? _reconnectDebounce;
   static const _reconnectDelay = Duration(milliseconds: 100);
+  bool _dropdownPossiblyOpen = false;
 
   @override
   void initState() {
     super.initState();
     _sysexController = TextEditingController(text: 'F0 7E 7F 06 01 F7');
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       _refreshDevices();
-      // Listen for device connect/disconnect events
-      LibremidiFlutter.onHotplug.listen((_) => _refreshDevices());
+      _hotplugSubscription = widget.midiAccess.onHotplug.listen((_) {
+        if (!mounted) return;
+        _closeOpenDropdownForHotplug();
+        _refreshDevices();
+      });
     });
   }
 
+  void _markDropdownOpened() {
+    _dropdownPossiblyOpen = true;
+  }
+
+  void _markDropdownClosed() {
+    _dropdownPossiblyOpen = false;
+  }
+
+  void _closeOpenDropdownForHotplug() {
+    if (!_dropdownPossiblyOpen) return;
+    final route = ModalRoute.of(context);
+    if (route != null && !route.isCurrent) {
+      Navigator.of(context).pop();
+    }
+    _dropdownPossiblyOpen = false;
+  }
+
   void _refreshDevices() {
-    // Get all available MIDI ports
-    final inputs = LibremidiFlutter.getInputPorts();
-    final outputs = LibremidiFlutter.getOutputPorts();
-
-    // Group ports by device name
-    final deviceMap = <String, MidiDevice>{};
-
-    for (final port in inputs) {
-      final name = port.deviceName.isNotEmpty
-          ? port.deviceName
-          : port.displayName;
-      deviceMap.putIfAbsent(name, () => MidiDevice(name));
-      deviceMap[name]!.inputPorts.add(port);
-      deviceMap[name]!.manufacturer ??= port.manufacturer;
-      deviceMap[name]!.transportType ??= port.transportType;
-    }
-
-    for (final port in outputs) {
-      final name = port.deviceName.isNotEmpty
-          ? port.deviceName
-          : port.displayName;
-      deviceMap.putIfAbsent(name, () => MidiDevice(name));
-      deviceMap[name]!.outputPorts.add(port);
-      deviceMap[name]!.manufacturer ??= port.manufacturer;
-      deviceMap[name]!.transportType ??= port.transportType;
-    }
-
-    final newDevices = deviceMap.values.toList()
-      ..sort((a, b) => a.name.compareTo(b.name));
+    final newDevices = widget.midiAccess.getDevices();
 
     String? statusMsg;
     bool connected = _deviceConnected;
@@ -150,14 +125,8 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
 
       if (!stillExists && _deviceConnected) {
         statusMsg = 'Disconnected: ${_selectedDevice!.name}';
-        if (_midiInput != null) {
-          LibremidiFlutter.disconnectInput(_midiInput!);
-          _midiInput = null;
-        }
-        if (_midiOutput != null) {
-          LibremidiFlutter.disconnectOutput(_midiOutput!);
-          _midiOutput = null;
-        }
+        _disconnectInput();
+        _disconnectOutput();
         connected = false;
       } else if (stillExists && !_deviceConnected) {
         newSelectedDevice = newDevices.firstWhere(
@@ -177,6 +146,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
       _addOutLog(statusMsg);
       _addInLog(statusMsg);
     }
+    if (!mounted) return;
     setState(() {
       _devices = newDevices;
       _selectedDevice = newSelectedDevice;
@@ -189,8 +159,8 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     if (device.inputPorts.isNotEmpty) {
       final idx = _selectedInputIndex.clamp(0, device.inputPorts.length - 1);
       try {
-        _midiInput = LibremidiFlutter.openInput(device.inputPorts[idx]);
-        _midiInput!.messages.listen(_onMidiMessage);
+        _midiInput = widget.midiAccess.openInput(device.inputPorts[idx]);
+        _midiInputSubscription = _midiInput!.messages.listen(_onMidiMessage);
         _addInLog(
           'Connected: ${device.name} [In ${idx + 1}/${device.inputCount}]',
         );
@@ -203,7 +173,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     if (device.outputPorts.isNotEmpty) {
       final idx = _selectedOutputIndex.clamp(0, device.outputPorts.length - 1);
       try {
-        _midiOutput = LibremidiFlutter.openOutput(device.outputPorts[idx]);
+        _midiOutput = widget.midiAccess.openOutput(device.outputPorts[idx]);
         _addOutLog(
           'Connected: ${device.name} [Out ${idx + 1}/${device.outputCount}]',
         );
@@ -214,13 +184,15 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   }
 
   void _onMidiMessage(MidiMessage msg) {
+    if (!mounted) return;
+    if (_inputChannel != null && msg.channel != _inputChannel) return;
     _inLogBuffer.add(_formatMidiMessage(msg));
     _inLogFlushTimer ??= Timer(_logFlushInterval, _flushInLog);
   }
 
   void _flushInLog() {
     _inLogFlushTimer = null;
-    if (_inLogBuffer.isEmpty) return;
+    if (!mounted || _inLogBuffer.isEmpty || _inLogController.isClosed) return;
     _inLog.insertAll(0, _inLogBuffer.reversed);
     _inLogBuffer.clear();
     if (_inLog.length > 100) _inLog.removeRange(100, _inLog.length);
@@ -232,14 +204,8 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     if (_selectedDevice != null &&
         (_midiInput != null || _midiOutput != null)) {
       final oldName = _selectedDevice!.name;
-      if (_midiInput != null) {
-        LibremidiFlutter.disconnectInput(_midiInput!);
-        _midiInput = null;
-      }
-      if (_midiOutput != null) {
-        LibremidiFlutter.disconnectOutput(_midiOutput!);
-        _midiOutput = null;
-      }
+      _disconnectInput();
+      _disconnectOutput();
       _addOutLog('Disconnected: $oldName');
       _addInLog('Disconnected: $oldName');
     }
@@ -260,14 +226,26 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   }
 
   String _formatMidiMessage(MidiMessage msg) {
-    if (msg.isNoteOn)
+    if (msg.isNoteOn) {
       return 'Note ${msg.note} vel:${msg.velocity} ch:${msg.channel + 1}';
+    }
     if (msg.isNoteOff) return 'NoteOff ${msg.note} ch:${msg.channel + 1}';
-    if (msg.type == 0xB0)
+    if (msg.type == 0xB0) {
       return 'CC ${msg.controller}=${msg.value} ch:${msg.channel + 1}';
-    if (msg.type == 0xC0) return 'PC ${msg.data[1]} ch:${msg.channel + 1}';
-    if (msg.type == 0xE0)
-      return 'PitchBend ${msg.data[1] | (msg.data[2] << 7)} ch:${msg.channel + 1}';
+    }
+    if (msg.isProgramChange) {
+      return 'PC ${msg.data.length > 1 ? msg.data[1] : 0} ch:${msg.channel + 1}';
+    }
+    if (msg.isPolyAftertouch) {
+      return 'PolyAftertouch note:${msg.note} pressure:${msg.value} ch:${msg.channel + 1}';
+    }
+    if (msg.isAftertouch) {
+      return 'Aftertouch ${msg.data.length > 1 ? msg.data[1] : 0} ch:${msg.channel + 1}';
+    }
+    if (msg.type == 0xE0) {
+      final value = msg.data.length > 2 ? msg.data[1] | (msg.data[2] << 7) : 0;
+      return 'PitchBend $value ch:${msg.channel + 1}';
+    }
     if (msg.isSysEx) {
       final total = msg.data.length;
       final show = total > 256 ? msg.data.sublist(0, 256) : msg.data;
@@ -283,12 +261,14 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   }
 
   void _addOutLog(String msg) {
+    if (_outLogController.isClosed) return;
     _outLog.insert(0, msg);
     if (_outLog.length > 100) _outLog.removeLast();
     _outLogController.add(List.from(_outLog));
   }
 
   void _addInLog(String msg) {
+    if (_inLogController.isClosed) return;
     _inLog.insert(0, msg);
     if (_inLog.length > 100) _inLog.removeLast();
     _inLogController.add(List.from(_inLog));
@@ -298,7 +278,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   void _sendNote() {
     if (_midiOutput == null) return;
 
-    final channel = _channel;
+    final channel = _outputChannel;
     final note = _note;
     final key = (channel << 8) | note;
 
@@ -316,22 +296,26 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   void _sendCC() {
     if (_midiOutput == null) return;
     _midiOutput!.sendControlChange(
-      channel: _channel,
+      channel: _outputChannel,
       controller: _cc,
       value: _ccValue,
     );
-    _addOutLog('CC $_cc=$_ccValue ch:${_channel + 1}');
+    _addOutLog('CC $_cc=$_ccValue ch:${_outputChannel + 1}');
   }
 
   // Send Program Change (with optional Bank Select)
   void _sendPC() {
     if (_midiOutput == null) return;
     if (_bank > 0) {
-      _midiOutput!.sendBankSelect(channel: _channel, bank: _bank, program: _pc);
-      _addOutLog('Bank $_bank PC $_pc ch:${_channel + 1}');
+      _midiOutput!.sendBankSelect(
+        channel: _outputChannel,
+        bank: _bank,
+        program: _pc,
+      );
+      _addOutLog('Bank $_bank PC $_pc ch:${_outputChannel + 1}');
     } else {
-      _midiOutput!.sendProgramChange(channel: _channel, program: _pc);
-      _addOutLog('PC $_pc ch:${_channel + 1}');
+      _midiOutput!.sendProgramChange(channel: _outputChannel, program: _pc);
+      _addOutLog('PC $_pc ch:${_outputChannel + 1}');
     }
   }
 
@@ -344,29 +328,69 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
           .where((s) => s.isNotEmpty)
           .map((s) => int.parse(s, radix: 16))
           .toList();
-      _midiOutput!.send(Uint8List.fromList(bytes));
+      if (bytes.isEmpty) {
+        throw const FormatException('No SysEx bytes');
+      }
+      final startsWithF0 = bytes.first == 0xF0;
+      final endsWithF7 = bytes.last == 0xF7;
+      if (startsWithF0 != endsWithF7) {
+        throw const FormatException('SysEx framing must include F0 and F7');
+      }
+      final alreadyFramed = startsWithF0 && endsWithF7;
+      _midiOutput!.sendSysEx(
+        Uint8List.fromList(bytes),
+        alreadyFramed: alreadyFramed,
+      );
+      final sentBytes = alreadyFramed ? bytes : [0xF0, ...bytes, 0xF7];
       _addOutLog(
-        'SysEx: ${bytes.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(' ')}',
+        'SysEx: ${sentBytes.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(' ')}',
       );
     } catch (e) {
       _addOutLog('SysEx error: $e');
     }
   }
 
+  void _sendPitchBend() {
+    if (_midiOutput == null) return;
+    _midiOutput!.sendPitchBend(channel: _outputChannel, value: _pitchBend);
+    _addOutLog('PitchBend $_pitchBend ch:${_outputChannel + 1}');
+  }
+
+  void _sendAftertouch() {
+    if (_midiOutput == null) return;
+    _midiOutput!.sendAftertouch(
+      channel: _outputChannel,
+      pressure: _aftertouchPressure,
+    );
+    _addOutLog('Aftertouch $_aftertouchPressure ch:${_outputChannel + 1}');
+  }
+
+  void _sendPolyAftertouch() {
+    if (_midiOutput == null) return;
+    _midiOutput!.sendPolyAftertouch(
+      channel: _outputChannel,
+      note: _note,
+      pressure: _polyAftertouchPressure,
+    );
+    _addOutLog(
+      'PolyAftertouch note:$_note pressure:$_polyAftertouchPressure ch:${_outputChannel + 1}',
+    );
+  }
+
   @override
   void dispose() {
-    _sysexController.dispose();
-    _outLogController.close();
-    _inLogController.close();
+    _hotplugSubscription?.cancel();
     _inLogFlushTimer?.cancel();
     _reconnectDebounce?.cancel();
     for (final timer in _noteOffTimers.values) {
       timer.cancel();
     }
     _noteOffTimers.clear();
-    // Clean up MIDI connections
-    if (_midiInput != null) LibremidiFlutter.disconnectInput(_midiInput!);
-    if (_midiOutput != null) LibremidiFlutter.disconnectOutput(_midiOutput!);
+    _disconnectInput();
+    _disconnectOutput();
+    _sysexController.dispose();
+    _outLogController.close();
+    _inLogController.close();
     super.dispose();
   }
 
@@ -376,7 +400,10 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final logHeight = (constraints.maxHeight * 0.35).clamp(150.0, 300.0);
+            final logHeight = (constraints.maxHeight * 0.35).clamp(
+              150.0,
+              300.0,
+            );
             return SingleChildScrollView(
               padding: const EdgeInsets.all(12.0),
               child: Column(
@@ -436,19 +463,51 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     );
   }
 
-  Widget _buildChannelDropdown({bool enabled = true}) {
-    return DropdownButtonFormField<int>(
-      initialValue: _channel,
+  Widget _buildInputChannelDropdown({bool enabled = true}) {
+    return DropdownButtonFormField<int?>(
+      initialValue: _inputChannel,
+      isExpanded: true,
       decoration: const InputDecoration(
-        labelText: 'CH',
-        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        labelText: 'In Ch',
+        contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+        border: OutlineInputBorder(),
+      ),
+      items: [
+        const DropdownMenuItem<int?>(
+          value: null,
+          child: Text('All', overflow: TextOverflow.ellipsis),
+        ),
+        ...List.generate(
+          16,
+          (i) => DropdownMenuItem<int?>(
+            value: i,
+            child: Text('${i + 1}', overflow: TextOverflow.ellipsis),
+          ),
+        ),
+      ],
+      onChanged: enabled ? (v) => setState(() => _inputChannel = v) : null,
+    );
+  }
+
+  Widget _buildOutputChannelDropdown({bool enabled = true}) {
+    return DropdownButtonFormField<int>(
+      initialValue: _outputChannel,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        labelText: 'Out Ch',
+        contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 12),
         border: OutlineInputBorder(),
       ),
       items: List.generate(
         16,
-        (i) => DropdownMenuItem(value: i, child: Text('${i + 1}')),
+        (i) => DropdownMenuItem(
+          value: i,
+          child: Text('${i + 1}', overflow: TextOverflow.ellipsis),
+        ),
       ),
-      onChanged: enabled ? (v) => setState(() => _channel = v ?? 0) : null,
+      onChanged: enabled
+          ? (v) => setState(() => _outputChannel = v ?? 0)
+          : null,
     );
   }
 
@@ -485,40 +544,10 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
 
   Widget _buildPortSelectors() {
     final device = _selectedDevice;
-    final inputEnabled = device != null && device.inputCount > 0;
-    final outputEnabled = device != null && device.outputCount > 0;
-
-    final outputDropdown = DropdownButtonFormField<int>(
-      initialValue: outputEnabled
-          ? _selectedOutputIndex.clamp(0, device.outputCount - 1)
-          : null,
-      isExpanded: true,
-      decoration: const InputDecoration(
-        labelText: 'Output Port',
-        contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-        border: OutlineInputBorder(),
-      ),
-      items: outputEnabled
-          ? List.generate(
-              device.outputCount,
-              (i) => DropdownMenuItem(
-                value: i,
-                child: Text(
-                  'Port ${i + 1}',
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            )
-          : [],
-      onChanged: outputEnabled
-          ? (v) {
-              if (v != null && v != _selectedOutputIndex) {
-                setState(() => _selectedOutputIndex = v);
-                _reconnectPorts();
-              }
-            }
-          : null,
-    );
+    final inputEnabled =
+        _deviceConnected && device != null && device.inputCount > 0;
+    final outputEnabled =
+        _deviceConnected && device != null && device.outputCount > 0;
 
     final inputDropdown = DropdownButtonFormField<int>(
       initialValue: inputEnabled
@@ -536,14 +565,18 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
               (i) => DropdownMenuItem(
                 value: i,
                 child: Text(
-                  'Port ${i + 1}',
+                  device.inputPorts[i].displayName.isNotEmpty
+                      ? device.inputPorts[i].displayName
+                      : 'Port ${i + 1}',
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
             )
           : [],
+      onTap: _markDropdownOpened,
       onChanged: inputEnabled
           ? (v) {
+              _markDropdownClosed();
               if (v != null && v != _selectedInputIndex) {
                 setState(() => _selectedInputIndex = v);
                 _reconnectPorts();
@@ -552,21 +585,72 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
           : null,
     );
 
+    final outputDropdown = DropdownButtonFormField<int>(
+      initialValue: outputEnabled
+          ? _selectedOutputIndex.clamp(0, device.outputCount - 1)
+          : null,
+      isExpanded: true,
+      decoration: const InputDecoration(
+        labelText: 'Output Port',
+        contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        border: OutlineInputBorder(),
+      ),
+      items: outputEnabled
+          ? List.generate(
+              device.outputCount,
+              (i) => DropdownMenuItem(
+                value: i,
+                child: Text(
+                  device.outputPorts[i].displayName.isNotEmpty
+                      ? device.outputPorts[i].displayName
+                      : 'Port ${i + 1}',
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            )
+          : [],
+      onTap: _markDropdownOpened,
+      onChanged: outputEnabled
+          ? (v) {
+              _markDropdownClosed();
+              if (v != null && v != _selectedOutputIndex) {
+                setState(() => _selectedOutputIndex = v);
+                _reconnectPorts();
+              }
+            }
+          : null,
+    );
+
+    final inputChannelDropdown = _buildInputChannelDropdown(
+      enabled: inputEnabled,
+    );
+    final outputChannelDropdown = _buildOutputChannelDropdown(
+      enabled: outputEnabled,
+    );
+
     final screenWidth = MediaQuery.of(context).size.width;
     if (screenWidth < 600) {
       return Column(
         children: [
+          inputDropdown,
+          const SizedBox(height: 8),
+          inputChannelDropdown,
+          const SizedBox(height: 8),
           outputDropdown,
           const SizedBox(height: 8),
-          inputDropdown,
+          outputChannelDropdown,
         ],
       );
     }
     return Row(
       children: [
-        Expanded(child: outputDropdown),
+        Expanded(flex: 3, child: inputDropdown),
         const SizedBox(width: 8),
-        Expanded(child: inputDropdown),
+        SizedBox(width: 96, child: inputChannelDropdown),
+        const SizedBox(width: 8),
+        Expanded(flex: 3, child: outputDropdown),
+        const SizedBox(width: 8),
+        SizedBox(width: 96, child: outputChannelDropdown),
       ],
     );
   }
@@ -580,19 +664,29 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     if (_selectedDevice == null) return;
     final device = _selectedDevice!;
 
-    if (_midiInput != null) {
-      LibremidiFlutter.disconnectInput(_midiInput!);
-      _midiInput = null;
-    }
-    if (_midiOutput != null) {
-      LibremidiFlutter.disconnectOutput(_midiOutput!);
-      _midiOutput = null;
-    }
+    _disconnectInput();
+    _disconnectOutput();
 
     _connectDeviceInternal(device);
     setState(() {
       _deviceConnected = _midiInput != null || _midiOutput != null;
     });
+  }
+
+  void _disconnectInput() {
+    _midiInputSubscription?.cancel();
+    _midiInputSubscription = null;
+    if (_midiInput != null) {
+      widget.midiAccess.disconnectInput(_midiInput!);
+      _midiInput = null;
+    }
+  }
+
+  void _disconnectOutput() {
+    if (_midiOutput != null) {
+      widget.midiAccess.disconnectOutput(_midiOutput!);
+      _midiOutput = null;
+    }
   }
 
   Widget _buildDeviceDropdown() {
@@ -637,7 +731,11 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
             ),
           )
           .toList(),
-      onChanged: _connectDevice,
+      onTap: _markDropdownOpened,
+      onChanged: (device) {
+        _markDropdownClosed();
+        _connectDevice(device);
+      },
     );
   }
 
@@ -660,7 +758,7 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
                         initialValue: _midiFunction,
                         isExpanded: true,
                         decoration: const InputDecoration(
-                          labelText: 'MIDI Function',
+                          labelText: 'MIDI Out Function',
                           border: OutlineInputBorder(),
                           contentPadding: EdgeInsets.symmetric(
                             horizontal: 8,
@@ -670,30 +768,58 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
                         items: const [
                           DropdownMenuItem(
                             value: 'CC',
-                            child: Text('Control Change', overflow: TextOverflow.ellipsis),
+                            child: Text(
+                              'Control Change',
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                           DropdownMenuItem(
                             value: 'PC',
-                            child: Text('Program Change', overflow: TextOverflow.ellipsis),
+                            child: Text(
+                              'Program Change',
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                           DropdownMenuItem(
                             value: 'SysEx',
-                            child: Text('SysEx', overflow: TextOverflow.ellipsis),
+                            child: Text(
+                              'SysEx',
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                           DropdownMenuItem(
                             value: 'Note',
-                            child: Text('Note', overflow: TextOverflow.ellipsis),
+                            child: Text(
+                              'Note',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: 'PitchBend',
+                            child: Text(
+                              'Pitch Bend',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Aftertouch',
+                            child: Text(
+                              'Aftertouch',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: 'PolyAftertouch',
+                            child: Text(
+                              'Poly Aftertouch',
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                         ],
                         onChanged: enabled
                             ? (v) => setState(() => _midiFunction = v ?? 'CC')
                             : null,
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    SizedBox(
-                      width: 80,
-                      child: _buildChannelDropdown(enabled: enabled),
                     ),
                   ],
                 ),
@@ -783,6 +909,56 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
           const SizedBox(height: 8),
           ElevatedButton(
             onPressed: enabled ? _sendSysEx : null,
+            child: const Text('Send'),
+          ),
+        ];
+      case 'PitchBend':
+        return [
+          _buildSlider(
+            'Bend',
+            _pitchBend,
+            0,
+            16383,
+            (v) => setState(() => _pitchBend = v),
+          ),
+          const SizedBox(height: 8),
+          ElevatedButton(
+            onPressed: enabled ? _sendPitchBend : null,
+            child: const Text('Send'),
+          ),
+        ];
+      case 'Aftertouch':
+        return [
+          _buildSlider(
+            'Pressure',
+            _aftertouchPressure,
+            0,
+            127,
+            (v) => setState(() => _aftertouchPressure = v),
+          ),
+          const SizedBox(height: 8),
+          ElevatedButton(
+            onPressed: enabled ? _sendAftertouch : null,
+            child: const Text('Send'),
+          ),
+        ];
+      case 'PolyAftertouch':
+        return [
+          _buildTwoSliderRow(
+            'Note',
+            _note,
+            0,
+            127,
+            (v) => setState(() => _note = v),
+            'Pressure',
+            _polyAftertouchPressure,
+            0,
+            127,
+            (v) => setState(() => _polyAftertouchPressure = v),
+          ),
+          const SizedBox(height: 8),
+          ElevatedButton(
+            onPressed: enabled ? _sendPolyAftertouch : null,
             child: const Text('Send'),
           ),
         ];

@@ -3,6 +3,10 @@
 #include <libremidi/backends/winuwp/helpers.hpp>
 #include <libremidi/detail/observer.hpp>
 
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
+
 NAMESPACE_LIBREMIDI
 {
 class observer_winuwp_internal
@@ -220,12 +224,83 @@ public:
 
   libremidi::API get_current_api() const noexcept override { return libremidi::API::WINDOWS_UWP; }
 
+  static int parse_bracket_index(const std::string& name)
+  {
+    if (name.size() < 4 || name.back() != ']')
+      return -1;
+
+    auto bracket = name.rfind(" [");
+    if (bracket == std::string::npos)
+      return -1;
+
+    int value = 0;
+    for (std::size_t i = bracket + 2; i < name.size() - 1; i++)
+    {
+      const char c = name[i];
+      if (c < '0' || c > '9')
+        return -1;
+      value = value * 10 + (c - '0');
+    }
+
+    return value;
+  }
+
+  static std::string strip_bracket_suffix(const std::string& name)
+  {
+    if (parse_bracket_index(name) < 0)
+      return name;
+    return name.substr(0, name.rfind(" ["));
+  }
+
+  template <typename PortList>
+  static void clean_port_names(PortList& ports, const std::vector<int>& bracket_indices)
+  {
+    if (ports.size() != bracket_indices.size())
+      return;
+
+    std::vector<std::pair<int, std::size_t>> order;
+    order.reserve(ports.size());
+    for (std::size_t i = 0; i < ports.size(); i++)
+    {
+      const int sort_key = bracket_indices[i] >= 0
+          ? bracket_indices[i]
+          : std::numeric_limits<int>::max();
+      order.emplace_back(sort_key, i);
+    }
+
+    std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+      return a.first < b.first;
+    });
+
+    PortList sorted;
+    sorted.reserve(ports.size());
+    for (const auto& item : order)
+      sorted.push_back(std::move(ports[item.second]));
+    ports = std::move(sorted);
+
+    std::unordered_map<std::string, int> counts;
+    for (const auto& port : ports)
+      counts[port.display_name]++;
+
+    std::unordered_map<std::string, int> seen;
+    for (auto& port : ports)
+    {
+      if (counts[port.display_name] > 1)
+      {
+        const int port_number = ++seen[port.display_name];
+        port.display_name += " Port " + std::to_string(port_number);
+      }
+    }
+  }
+
   template <bool Input>
-  auto to_port_info(const observer_winuwp_internal::port_info& p) const noexcept
+  auto to_port_info(const observer_winuwp_internal::port_info& p, int& bracket_idx) const noexcept
       -> std::conditional_t<Input, input_port, output_port>
   {
     std::string portId = to_string(p.id);
-    std::string displayName = to_string(p.name);
+    std::string rawName = to_string(p.name);
+    bracket_idx = parse_bracket_index(rawName);
+    std::string displayName = bracket_idx >= 0 ? strip_bracket_suffix(rawName) : rawName;
 
     // Get extended device info via cfgmgr32
     winuwp_device_info info = get_device_info_from_port_id(portId);
@@ -241,19 +316,39 @@ public:
          .type = static_cast<transport_type>(info.transport_type)}};
   }
 
+  template <bool Input>
+  auto to_port_info(const observer_winuwp_internal::port_info& p) const noexcept
+      -> std::conditional_t<Input, input_port, output_port>
+  {
+    int unused{};
+    return to_port_info<Input>(p, unused);
+  }
+
   std::vector<libremidi::input_port> get_input_ports() const noexcept override
   {
     std::vector<libremidi::input_port> ret;
+    std::vector<int> indices;
     for (auto& port : get_internal_in_port_observer().get_ports())
-      ret.push_back(to_port_info<true>(port));
+    {
+      int index{};
+      ret.push_back(to_port_info<true>(port, index));
+      indices.push_back(index);
+    }
+    clean_port_names(ret, indices);
     return ret;
   }
 
   std::vector<libremidi::output_port> get_output_ports() const noexcept override
   {
     std::vector<libremidi::output_port> ret;
+    std::vector<int> indices;
     for (auto& port : get_internal_out_port_observer().get_ports())
-      ret.push_back(to_port_info<false>(port));
+    {
+      int index{};
+      ret.push_back(to_port_info<false>(port, index));
+      indices.push_back(index);
+    }
+    clean_port_names(ret, indices);
     return ret;
   }
 

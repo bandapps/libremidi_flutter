@@ -46,6 +46,8 @@ public:
     if (!ep || !gp)
       return std::errc::address_not_available;
 
+    m_group = gp.FirstGroup().Index();
+
     m_endpoint = m_session.CreateEndpointConnection(ep.EndpointDeviceId());
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
     m_endpoint.as(libremidi::IID_IMidiEndpointConnectionRaw, m_raw_endpoint.put_void());
@@ -67,23 +69,31 @@ public:
   stdx::error send_ump(const uint32_t* message, size_t size) override
   {
     auto write_func = [this](const uint32_t* ump, int64_t bytes) -> std::errc {
+      auto count = bytes / 4;
+      if (count < 1 || count > 4)
+        return std::errc::bad_message;
+
+      // Patch UMP group field (bits 27-24) to target the correct Group Terminal Block
+      uint32_t w[4] = {};
+      for (int64_t i = 0; i < count; i++) w[i] = ump[i];
+      w[0] = (w[0] & 0xF0FFFFFF) | (static_cast<uint32_t>(m_group & 0xF) << 24);
 
 #if !LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
       MidiSendMessageResults ret{};
-      switch (bytes / 4)
+      switch (count)
       {
         case 1:
-          ret = m_endpoint.SendSingleMessagePacket(MidiMessage32(0, ump[0]));
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage32(0, w[0]));
           break;
         case 2:
-          ret = m_endpoint.SendSingleMessagePacket(MidiMessage64(0, ump[0], ump[1]));
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage64(0, w[0], w[1]));
           break;
         case 3:
-          ret = m_endpoint.SendSingleMessagePacket(MidiMessage96(0, ump[0], ump[1], ump[2]));
+          ret = m_endpoint.SendSingleMessagePacket(MidiMessage96(0, w[0], w[1], w[2]));
           break;
         case 4:
           ret = m_endpoint.SendSingleMessagePacket(
-              MidiMessage128(0, ump[0], ump[1], ump[2], ump[3]));
+              MidiMessage128(0, w[0], w[1], w[2], w[3]));
           break;
         default:
           return std::errc::bad_message;
@@ -92,23 +102,23 @@ public:
         return std::errc::bad_message;
   #else
       HRESULT ret{};
-      switch (bytes / 4)
+      switch (count)
       {
         case 1:
-          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(1, (UINT32*)ump));
-          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 1, (UINT32*)ump);
+          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(1, w));
+          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 1, w);
           break;
         case 2:
-          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(2, (UINT32*)ump));
-          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 2, (UINT32*)ump);
+          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(2, w));
+          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 2, w);
           break;
         case 3:
-          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(3, (UINT32*)ump));
-          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 3, (UINT32*)ump);
+          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(3, w));
+          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 3, w);
           break;
         case 4:
-          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(4, (UINT32*)ump));
-          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 4, (UINT32*)ump);
+          assert( m_raw_endpoint->ValidateBufferHasOnlyCompleteUmps(4, w));
+          ret = m_raw_endpoint->SendMidiMessagesRaw(0, 4, w);
           break;
         default:
           return std::errc::bad_message;
@@ -128,6 +138,7 @@ private:
 #if LIBREMIDI_WINMIDI_HAS_COM_EXTENSIONS
   winrt::impl::com_ref<IMidiEndpointConnectionRaw> m_raw_endpoint{};
 #endif
+  int m_group = 0;
 };
 
 }

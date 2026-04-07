@@ -58,8 +58,8 @@ android {
     }
 
     defaultConfig {
-        // AMidi API requires API 29+, JNI_GetCreatedJavaVMs requires API 31+
-        minSdk = 31
+        // AMidi API requires API 29+.
+        minSdk = 29
     }
 }
 

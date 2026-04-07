@@ -81,8 +81,9 @@ typedef void (*LrmMidiCallback)(
     int64_t timestamp
 );
 
-// Called when MIDI device is added or removed
-// event_type: 0 = input_added, 1 = input_removed, 2 = output_added, 3 = output_removed
+// Called when MIDI device configuration changes
+// event_type: 0 = input_added, 1 = input_removed, 2 = output_added,
+//             3 = output_removed, 4 = setup_changed (generic, re-enumerate)
 typedef void (*LrmHotplugCallback)(
     void* context,
     int32_t event_type
@@ -133,6 +134,9 @@ FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observer, int32_t
 // Open a MIDI output port by index
 FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer, int32_t port_index);
 
+// Open a MIDI output port by port_id (stable across hotplug)
+FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* observer, uint64_t port_id);
+
 // Close and free a MIDI output
 FFI_PLUGIN_EXPORT void lrm_midi_out_close(LrmMidiOut* midi_out);
 
@@ -154,6 +158,17 @@ FFI_PLUGIN_EXPORT int32_t lrm_midi_out_send(LrmMidiOut* midi_out, const uint8_t*
 FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open(
     LrmObserver* observer,
     int32_t port_index,
+    LrmMidiCallback callback,
+    void* context,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+);
+
+// Open a MIDI input port by port_id (stable across hotplug)
+FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
+    LrmObserver* observer,
+    uint64_t port_id,
     LrmMidiCallback callback,
     void* context,
     bool receive_sysex,

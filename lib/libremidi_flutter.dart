@@ -178,22 +178,22 @@ class MidiPort {
 
   /// Returns all port info as a Map (keys match libremidi naming).
   Map<String, dynamic> toMap() => {
-    'stable_id': stableId,
-    'effective_stable_id': effectiveStableId,
-    'port': portId,
-    'client': clientHandle,
-    'index': index,
-    'display_name': displayName,
-    'port_name': portName,
-    'device_name': deviceName,
-    'manufacturer': manufacturer,
-    'product': product,
-    'serial': serial,
-    'type': transportType.name,
-    'raw_transport_type': rawTransportType,
-    'is_input': isInput,
-    'is_virtual': isVirtual,
-  };
+        'stable_id': stableId,
+        'effective_stable_id': effectiveStableId,
+        'port': portId,
+        'client': clientHandle,
+        'index': index,
+        'display_name': displayName,
+        'port_name': portName,
+        'device_name': deviceName,
+        'manufacturer': manufacturer,
+        'product': product,
+        'serial': serial,
+        'type': transportType.name,
+        'raw_transport_type': rawTransportType,
+        'is_input': isInput,
+        'is_virtual': isVirtual,
+      };
 
   @override
   String toString() =>
@@ -319,7 +319,11 @@ enum HotplugEventType {
   inputAdded,
   inputRemoved,
   outputAdded,
-  outputRemoved;
+  outputRemoved,
+
+  /// Generic setup change (e.g. macOS/iOS kMIDIMsgSetupChanged).
+  /// The OS does not specify what changed — clients should re-enumerate ports.
+  setupChanged;
 
   static HotplugEventType fromValue(int value) {
     switch (value) {
@@ -331,6 +335,8 @@ enum HotplugEventType {
         return HotplugEventType.outputAdded;
       case 3:
         return HotplugEventType.outputRemoved;
+      case 4:
+        return HotplugEventType.setupChanged;
       default:
         return HotplugEventType.unknown;
     }
@@ -361,8 +367,8 @@ class MidiObserver {
   MidiObserver.withHotplug() {
     _hotplugCallable =
         NativeCallable<Void Function(Pointer<Void>, Int32)>.listener(
-          _onHotplugEvent,
-        );
+      _onHotplugEvent,
+    );
 
     _handle = _bindings.lrm_observer_new_with_callbacks(
       _hotplugCallable!.nativeFunction,
@@ -457,15 +463,21 @@ class MidiObserver {
   }
 
   /// Opens a MIDI output connection to the specified port.
+  ///
+  /// The port is resolved by [MidiPort.portId], which is stable across
+  /// hotplug events (unlike index-based lookup).
   MidiOutput openOutput(MidiPort port) {
     _checkDisposed();
     if (port.isInput) {
       throw ArgumentError('Port must be an output port');
     }
-    return MidiOutput._(_handle!, port.index);
+    return MidiOutput._byId(_handle!, port.portId);
   }
 
   /// Opens a MIDI input connection to the specified port.
+  ///
+  /// The port is resolved by [MidiPort.portId], which is stable across
+  /// hotplug events (unlike index-based lookup).
   ///
   /// By default, SysEx messages are received, while timing (MIDI clock) and
   /// active sensing messages are filtered out.
@@ -479,9 +491,9 @@ class MidiObserver {
     if (!port.isInput) {
       throw ArgumentError('Port must be an input port');
     }
-    return MidiInput._(
+    return MidiInput._byId(
       _handle!,
-      port.index,
+      port.portId,
       receiveSysex: receiveSysex,
       receiveTiming: receiveTiming,
       receiveSensing: receiveSensing,
@@ -501,16 +513,16 @@ class MidiObserver {
   /// Disposes the observer and releases resources.
   void dispose() {
     if (!_disposed && _handle != null) {
-      // Order matters to avoid race conditions:
-      // 1. Mark disposed first to reject new callbacks
+      // Order matters to avoid use-after-free:
+      // 1. Mark disposed first to reject new callbacks in Dart
       _disposed = true;
-      // 2. Close Dart stream controller
-      _hotplugController.close();
-      // 3. Close native callable (stops callbacks from native)
-      _hotplugCallable?.close();
-      // 4. Finally free native resources
+      // 2. Free native resources first (stops the native producer)
       _bindings.lrm_observer_free(_handle!);
       _handle = null;
+      // 3. Now safe to close the callable (no native code can call it)
+      _hotplugCallable?.close();
+      // 4. Close Dart stream controller
+      _hotplugController.close();
     }
   }
 
@@ -535,8 +547,8 @@ class MidiOutput {
   Pointer<LrmMidiOut>? _handle;
   bool _disposed = false;
 
-  MidiOutput._(Pointer<LrmObserver> observer, int portIndex) {
-    _handle = _bindings.lrm_midi_out_open(observer, portIndex);
+  MidiOutput._byId(Pointer<LrmObserver> observer, int portId) {
+    _handle = _bindings.lrm_midi_out_open_by_id(observer, portId);
     if (_handle == nullptr) {
       throw const MidiException('Failed to open MIDI output');
     }
@@ -585,16 +597,10 @@ class MidiOutput {
     required int note,
     required int velocity,
   }) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(note >= 0 && note < 128, 'Note must be 0-127');
-    assert(velocity >= 0 && velocity < 128, 'Velocity must be 0-127');
-    send(
-      Uint8List.fromList([
-        0x90 | (channel & 0x0F),
-        note & 0x7F,
-        velocity & 0x7F,
-      ]),
-    );
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
+    send(Uint8List.fromList([0x90 | channel, note, velocity]));
   }
 
   /// Sends a Note Off message.
@@ -603,16 +609,10 @@ class MidiOutput {
     required int note,
     int velocity = 0,
   }) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(note >= 0 && note < 128, 'Note must be 0-127');
-    assert(velocity >= 0 && velocity < 128, 'Velocity must be 0-127');
-    send(
-      Uint8List.fromList([
-        0x80 | (channel & 0x0F),
-        note & 0x7F,
-        velocity & 0x7F,
-      ]),
-    );
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
+    send(Uint8List.fromList([0x80 | channel, note, velocity]));
   }
 
   /// Sends a Control Change message.
@@ -621,33 +621,27 @@ class MidiOutput {
     required int controller,
     required int value,
   }) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(controller >= 0 && controller < 128, 'Controller must be 0-127');
-    assert(value >= 0 && value < 128, 'Value must be 0-127');
-    send(
-      Uint8List.fromList([
-        0xB0 | (channel & 0x0F),
-        controller & 0x7F,
-        value & 0x7F,
-      ]),
-    );
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(controller, 0, 127, 'controller');
+    RangeError.checkValueInInterval(value, 0, 127, 'value');
+    send(Uint8List.fromList([0xB0 | channel, controller, value]));
   }
 
   /// Sends a Program Change message.
   void sendProgramChange({required int channel, required int program}) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(program >= 0 && program < 128, 'Program must be 0-127');
-    send(Uint8List.fromList([0xC0 | (channel & 0x0F), program & 0x7F]));
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(program, 0, 127, 'program');
+    send(Uint8List.fromList([0xC0 | channel, program]));
   }
 
   /// Sends a Pitch Bend message.
   /// Value is 14-bit (0-16383), center is 8192.
   void sendPitchBend({required int channel, required int value}) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(value >= 0 && value <= 16383, 'Pitch bend value must be 0-16383');
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(value, 0, 16383, 'value');
     final lsb = value & 0x7F;
     final msb = (value >> 7) & 0x7F;
-    send(Uint8List.fromList([0xE0 | (channel & 0x0F), lsb, msb]));
+    send(Uint8List.fromList([0xE0 | channel, lsb, msb]));
   }
 
   /// Sends Bank Select (CC 0 = MSB, CC 32 = LSB) followed by Program Change.
@@ -660,9 +654,9 @@ class MidiOutput {
     required int bank,
     required int program,
   }) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(bank >= 0 && bank < 16384, 'Bank must be 0-16383');
-    assert(program >= 0 && program < 128, 'Program must be 0-127');
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(bank, 0, 16383, 'bank');
+    RangeError.checkValueInInterval(program, 0, 127, 'program');
     final msb = (bank >> 7) & 0x7F;
     final lsb = bank & 0x7F;
     sendControlChange(channel: channel, controller: 0, value: msb);
@@ -689,9 +683,9 @@ class MidiOutput {
 
   /// Sends Channel Aftertouch (Channel Pressure).
   void sendAftertouch({required int channel, required int pressure}) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(pressure >= 0 && pressure < 128, 'Pressure must be 0-127');
-    send(Uint8List.fromList([0xD0 | (channel & 0x0F), pressure & 0x7F]));
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
+    send(Uint8List.fromList([0xD0 | channel, pressure]));
   }
 
   /// Sends Polyphonic Aftertouch (Key Pressure).
@@ -700,16 +694,10 @@ class MidiOutput {
     required int note,
     required int pressure,
   }) {
-    assert(channel >= 0 && channel < 16, 'Channel must be 0-15');
-    assert(note >= 0 && note < 128, 'Note must be 0-127');
-    assert(pressure >= 0 && pressure < 128, 'Pressure must be 0-127');
-    send(
-      Uint8List.fromList([
-        0xA0 | (channel & 0x0F),
-        note & 0x7F,
-        pressure & 0x7F,
-      ]),
-    );
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
+    send(Uint8List.fromList([0xA0 | channel, note, pressure]));
   }
 
   /// Closes the output connection and releases resources.
@@ -731,25 +719,24 @@ class MidiInput {
   Pointer<LrmMidiIn>? _handle;
   bool _disposed = false;
   NativeCallable<Void Function(Pointer<Void>, Pointer<Uint8>, Size, Int64)>?
-  _callback;
+      _callback;
   final StreamController<MidiMessage> _messageController =
       StreamController<MidiMessage>.broadcast();
 
-  MidiInput._(
+  MidiInput._byId(
     Pointer<LrmObserver> observer,
-    int portIndex, {
+    int portId, {
     required bool receiveSysex,
     required bool receiveTiming,
     required bool receiveSensing,
   }) {
-    _callback =
-        NativeCallable<
-          Void Function(Pointer<Void>, Pointer<Uint8>, Size, Int64)
-        >.listener(_onMidiMessage);
+    _callback = NativeCallable<
+        Void Function(Pointer<Void>, Pointer<Uint8>, Size,
+            Int64)>.listener(_onMidiMessage);
 
-    _handle = _bindings.lrm_midi_in_open(
+    _handle = _bindings.lrm_midi_in_open_by_id(
       observer,
-      portIndex,
+      portId,
       _callback!.nativeFunction,
       nullptr,
       receiveSysex,
@@ -793,11 +780,12 @@ class MidiInput {
 
   /// Stream of incoming MIDI messages with optional filtering.
   ///
-  /// Filters out messages that exceed [maxBytes] (default: 1024). This is
-  /// useful to prevent memory issues from large SysEx dumps while still
-  /// receiving normal MIDI messages.
-  ///
-  /// Set [excludeSysEx] to true to filter out all SysEx messages.
+  /// Filters out messages that exceed [maxBytes] (default: 1024) or,
+  /// optionally, all SysEx messages. This is a convenience filter on the
+  /// Dart side — note that messages are still received and allocated by the
+  /// native callback before filtering. To prevent large SysEx allocations
+  /// entirely, disable SysEx at the input level via [MidiObserver.openInput]
+  /// with `receiveSysex: false`.
   ///
   /// Example:
   /// ```dart
@@ -827,16 +815,16 @@ class MidiInput {
   /// Closes the input connection and releases resources.
   void dispose() {
     if (!_disposed && _handle != null) {
-      // Order matters to avoid race conditions:
-      // 1. Mark disposed first to reject new callbacks
+      // Order matters to avoid use-after-free:
+      // 1. Mark disposed first to reject new callbacks in Dart
       _disposed = true;
-      // 2. Close Dart stream controller
-      _messageController.close();
-      // 3. Close native callable (stops callbacks from native)
-      _callback?.close();
-      // 4. Finally close native MIDI input
+      // 2. Close native MIDI input first (stops the native producer)
       _bindings.lrm_midi_in_close(_handle!);
       _handle = null;
+      // 3. Now safe to close the callable (no native code can call it)
+      _callback?.close();
+      // 4. Close Dart stream controller
+      _messageController.close();
     }
   }
 }

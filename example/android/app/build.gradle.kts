@@ -24,7 +24,7 @@ android {
         applicationId = "com.example.libremidi_flutter_example"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = 31  // Required for AMidi API
+        minSdk = 29  // Required for AMidi API
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

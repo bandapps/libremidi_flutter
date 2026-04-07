@@ -14,51 +14,70 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 - Device identification across reconnects
 - Device infos
 - Simple API for sending and receiving messages
+- Windows: prefers Windows MIDI Services (WinMIDI) when available, falls back to WinUWP
 
 ## Installation
 
 ```yaml
 dependencies:
-  libremidi_flutter: ^0.8.2
+  libremidi_flutter: ^0.8.3
 ```
 
 ## Usage
 
 ```dart
+import 'dart:typed_data';
+
 import 'package:libremidi_flutter/libremidi_flutter.dart';
 ```
 
-### Listing devices
+MIDI channels are zero-based in this package: channel `0` means MIDI channel 1, channel `15` means MIDI channel 16.
+
+### Quick start
 
 ```dart
+import 'dart:typed_data';
+
+import 'package:libremidi_flutter/libremidi_flutter.dart';
+
 final inputs = LibremidiFlutter.getInputPorts();
 final outputs = LibremidiFlutter.getOutputPorts();
 
-for (final port in inputs) {
-  print('${port.displayName} - ${port.manufacturer}');
+if (inputs.isNotEmpty) {
+  final input = LibremidiFlutter.openInput(inputs.first);
+  input.messages.listen((msg) {
+    if (msg.isControlChange) {
+      print('CC ${msg.controller}=${msg.value} ch:${msg.channel + 1}');
+    }
+  });
 }
+
+if (outputs.isNotEmpty) {
+  final output = LibremidiFlutter.openOutput(outputs.first);
+  output.sendControlChange(channel: 0, controller: 1, value: 64);
+  output.sendSysEx(Uint8List.fromList([0x7E, 0x7F, 0x06, 0x01]));
+}
+
+LibremidiFlutter.onHotplug.listen((_) {
+  // Device connected or disconnected - refresh your device list.
+  final currentInputs = LibremidiFlutter.getInputPorts();
+  final currentOutputs = LibremidiFlutter.getOutputPorts();
+  print('MIDI ports: ${currentInputs.length} in, ${currentOutputs.length} out');
+});
 ```
 
-### Connecting to a device
+### Connecting and disconnecting
 
 ```dart
-final input = LibremidiFlutter.openInput(inputs[0]);
-final output = LibremidiFlutter.openOutput(outputs[0]);
-```
+final input = LibremidiFlutter.openInput(inputs.first);
+final output = LibremidiFlutter.openOutput(outputs.first);
 
-### Input options
+// Disconnect specific ports.
+LibremidiFlutter.disconnectInput(input);
+LibremidiFlutter.disconnectOutput(output);
 
-By default, SysEx messages are received while MIDI clock and active sensing are filtered out.
-
-```dart
-// Receive MIDI clock (timing) messages
-final input = LibremidiFlutter.openInput(port, receiveTiming: true);
-
-// Disable SysEx reception
-final input = LibremidiFlutter.openInput(port, receiveSysex: false);
-
-// Receive active sensing messages
-final input = LibremidiFlutter.openInput(port, receiveSensing: true);
+// Or disconnect all and cleanup.
+LibremidiFlutter.dispose();
 ```
 
 ### Sending Control Change (CC)
@@ -96,6 +115,13 @@ output.send(Uint8List.fromList([0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7]));
 output.sendSysEx(Uint8List.fromList([0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7]), alreadyFramed: true);
 ```
 
+SysEx receiving is enabled by default:
+
+```dart
+// Disable SysEx reception if you do not need SysEx dumps.
+final inputWithoutSysEx = LibremidiFlutter.openInput(port, receiveSysex: false);
+```
+
 ### Sending Pitch Bend
 
 ```dart
@@ -115,6 +141,8 @@ output.sendPolyAftertouch(channel: 0, note: 60, pressure: 64);
 
 ### Receiving MIDI messages
 
+By default, MIDI clock and active sensing messages are filtered out.
+
 ```dart
 input.messages.listen((msg) {
   // isNoteOn/isNoteOff: msg.note, msg.velocity, msg.channel
@@ -125,30 +153,15 @@ input.messages.listen((msg) {
   // isPolyAftertouch: msg.note, msg.data[2], msg.channel
   // isSysEx: msg.data
   if (msg.isControlChange) {
-    print('CC ${msg.controller}=${msg.value} ch:${msg.channel}');
+    print('CC ${msg.controller}=${msg.value} ch:${msg.channel + 1}');
   }
 });
-```
 
-### Hotplug detection
+// Receive MIDI clock (timing) messages.
+final timingInput = LibremidiFlutter.openInput(port, receiveTiming: true);
 
-```dart
-LibremidiFlutter.onHotplug.listen((_) {
-  // Device connected or disconnected - refresh your device list
-  final inputs = LibremidiFlutter.getInputPorts();
-  final outputs = LibremidiFlutter.getOutputPorts();
-});
-```
-
-### Disconnecting
-
-```dart
-// Disconnect specific ports
-LibremidiFlutter.disconnectInput(input);
-LibremidiFlutter.disconnectOutput(output);
-
-// Or disconnect all and cleanup
-LibremidiFlutter.dispose();
+// Receive active sensing messages.
+final sensingInput = LibremidiFlutter.openInput(port, receiveSensing: true);
 ```
 
 ## Port properties
@@ -227,8 +240,14 @@ print(port.toMap());
 ### Refresh port list
 
 ```dart
-// Manually refresh port cache (usually not needed)
+// High-level usage: re-read the current list when needed.
+final inputs = LibremidiFlutter.getInputPorts();
+final outputs = LibremidiFlutter.getOutputPorts();
+
+// Advanced usage: if you manage your own observer, refresh its cache manually.
+final observer = MidiObserver();
 observer.refresh();
+observer.dispose();
 ```
 
 ## Platform requirements
@@ -236,18 +255,20 @@ observer.refresh();
 | Platform | Minimum Version |
 |----------|-----------------|
 | iOS | 13.0 |
-| Android | API 31 (Android 12) |
+| Android | API 29 (Android 10) |
 | macOS | 10.15 |
 | Windows | 10 |
 | Linux | ALSA |
 
 ## Notes
 
-- Focused on control-oriented workflows
 - BLE MIDI requires native platform integration
+- See the bundled `example/` app for device selection, port selection, hotplug handling, MIDI input logs, and common output message types.
 
 ## License
 
-BSD-2-Clause. See [LICENSE](LICENSE) for details.
+BSD-2-Clause. See [LICENSE](LICENSE) for details and bundled third-party notices.
+
+This package bundles libremidi and a minimal Microsoft.Windows.Devices.Midi2 WinMIDI SDK subset for Windows builds. Their license notices are included in [LICENSE](LICENSE) and the corresponding `third_party/` directories.
 
 Based on [libremidi](https://github.com/jcelerier/libremidi) by Jean-Michaël Celerier.
