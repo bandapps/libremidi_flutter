@@ -10,7 +10,7 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 
 - MIDI Input / Output
 - Hotplug detection (device connect/disconnect)
-- Control Change, Program Change, Note On/Off, Pitch Bend, Aftertouch, SysEx
+- Common MIDI messages including CC, PC, Note On/Off, Pitch Bend, Aftertouch, SysEx, and RPN/NRPN
 - Device identification across reconnects
 - Device infos
 - Simple API for sending and receiving messages
@@ -20,7 +20,7 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 
 ```yaml
 dependencies:
-  libremidi_flutter: ^0.8.3
+  libremidi_flutter: ^0.8.4
 ```
 
 ## Usage
@@ -128,6 +128,36 @@ final inputWithoutSysEx = LibremidiFlutter.openInput(port, receiveSysex: false);
 // Value is 14-bit (0-16383), center is 8192
 output.sendPitchBend(channel: 0, value: 8192);
 ```
+
+### RPN / NRPN input and output
+
+```dart
+// RPN 0: Pitch Bend Sensitivity, 7-bit value
+output.sendRpn(channel: 0, parameter: 0, value: 2, fourteenBit: false);
+
+// Device-specific NRPN parameter, 14-bit value
+output.sendNrpn(channel: 0, parameter: 1234, value: 8192);
+
+// Relative Data Increment / Decrement
+output.incrementRpn(channel: 0, parameter: 0);
+output.decrementNrpn(channel: 0, parameter: 1234);
+```
+
+RPN and NRPN support uses standard MIDI Control Change sequences. Parameter
+meanings are device-specific unless defined by the MIDI specification. Increment
+and decrement use CC 96/97; the `amount` byte is device-dependent.
+
+To decode incoming RPN/NRPN Control Change sequences:
+
+```dart
+input.rpnNrpnMessages.listen((msg) {
+  print('${msg.type.name} ${msg.parameter}=${msg.value} ch:${msg.channel + 1}');
+});
+```
+
+The decoder emits a 7-bit value event when Data Entry MSB (CC 6) arrives, a
+14-bit value event when Data Entry LSB (CC 38) follows, and relative
+increment/decrement events for CC 96/97.
 
 ### Sending Aftertouch
 

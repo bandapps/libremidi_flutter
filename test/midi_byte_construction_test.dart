@@ -318,6 +318,202 @@ void main() {
     });
   });
 
+  group('RPN byte construction', () {
+    test('14-bit RPN sequence with deselect', () {
+      const channel = 2;
+      const parameter = 129;
+      const value = 8193;
+      final parameterMsb = (parameter >> 7) & 0x7F;
+      final parameterLsb = parameter & 0x7F;
+      final valueMsb = (value >> 7) & 0x7F;
+      final valueLsb = value & 0x7F;
+
+      final sequence = [
+        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 6, valueMsb]),
+        Uint8List.fromList([0xB0 | channel, 38, valueLsb]),
+        Uint8List.fromList([0xB0 | channel, 101, 127]),
+        Uint8List.fromList([0xB0 | channel, 100, 127]),
+      ];
+
+      expect(parameterMsb, 1);
+      expect(parameterLsb, 1);
+      expect(valueMsb, 64);
+      expect(valueLsb, 1);
+      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
+        101,
+        100,
+        6,
+        38,
+        101,
+        100,
+      ]);
+      expect(sequence.map((bytes) => MidiMessage(bytes).value), [
+        1,
+        1,
+        64,
+        1,
+        127,
+        127,
+      ]);
+    });
+
+    test('7-bit RPN sequence without deselect', () {
+      const parameter = 0;
+      const value = 2;
+
+      final sequence = [
+        Uint8List.fromList([0xB0, 101, (parameter >> 7) & 0x7F]),
+        Uint8List.fromList([0xB0, 100, parameter & 0x7F]),
+        Uint8List.fromList([0xB0, 6, value]),
+      ];
+
+      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
+        101,
+        100,
+        6,
+      ]);
+      expect(sequence.map((bytes) => MidiMessage(bytes).value), [0, 0, 2]);
+    });
+
+    test('RPN max 14-bit parameter and value split to 127/127', () {
+      const parameter = 16383;
+      const value = 16383;
+      expect((parameter >> 7) & 0x7F, 127);
+      expect(parameter & 0x7F, 127);
+      expect((value >> 7) & 0x7F, 127);
+      expect(value & 0x7F, 127);
+    });
+
+    test('RPN increment and decrement use CC 96/97', () {
+      const channel = 3;
+      const parameter = 129;
+      const amount = 1;
+      final parameterMsb = (parameter >> 7) & 0x7F;
+      final parameterLsb = parameter & 0x7F;
+
+      final incrementSequence = [
+        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 96, amount]),
+      ];
+      final decrementSequence = [
+        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 97, amount]),
+      ];
+
+      expect(incrementSequence.map((bytes) => MidiMessage(bytes).controller), [
+        101,
+        100,
+        96,
+      ]);
+      expect(decrementSequence.map((bytes) => MidiMessage(bytes).controller), [
+        101,
+        100,
+        97,
+      ]);
+    });
+  });
+
+  group('NRPN byte construction', () {
+    test('14-bit NRPN sequence with deselect', () {
+      const channel = 15;
+      const parameter = 1234;
+      const value = 256;
+      final parameterMsb = (parameter >> 7) & 0x7F;
+      final parameterLsb = parameter & 0x7F;
+      final valueMsb = (value >> 7) & 0x7F;
+      final valueLsb = value & 0x7F;
+
+      final sequence = [
+        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 6, valueMsb]),
+        Uint8List.fromList([0xB0 | channel, 38, valueLsb]),
+        Uint8List.fromList([0xB0 | channel, 99, 127]),
+        Uint8List.fromList([0xB0 | channel, 98, 127]),
+      ];
+
+      expect(parameterMsb, 9);
+      expect(parameterLsb, 82);
+      expect(valueMsb, 2);
+      expect(valueLsb, 0);
+      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
+        99,
+        98,
+        6,
+        38,
+        99,
+        98,
+      ]);
+      expect(sequence.map((bytes) => MidiMessage(bytes).value), [
+        9,
+        82,
+        2,
+        0,
+        127,
+        127,
+      ]);
+      expect(sequence.every((bytes) => MidiMessage(bytes).channel == channel),
+          isTrue);
+    });
+
+    test('7-bit NRPN sequence without deselect', () {
+      const parameter = 128;
+      const value = 127;
+
+      final sequence = [
+        Uint8List.fromList([0xB0, 99, (parameter >> 7) & 0x7F]),
+        Uint8List.fromList([0xB0, 98, parameter & 0x7F]),
+        Uint8List.fromList([0xB0, 6, value]),
+      ];
+
+      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
+        99,
+        98,
+        6,
+      ]);
+      expect(sequence.map((bytes) => MidiMessage(bytes).value), [1, 0, 127]);
+    });
+
+    test('NRPN increment and decrement use CC 96/97', () {
+      const channel = 4;
+      const parameter = 1234;
+      const amount = 2;
+      final parameterMsb = (parameter >> 7) & 0x7F;
+      final parameterLsb = parameter & 0x7F;
+
+      final incrementSequence = [
+        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 96, amount]),
+      ];
+      final decrementSequence = [
+        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
+        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
+        Uint8List.fromList([0xB0 | channel, 97, amount]),
+      ];
+
+      expect(incrementSequence.map((bytes) => MidiMessage(bytes).controller), [
+        99,
+        98,
+        96,
+      ]);
+      expect(decrementSequence.map((bytes) => MidiMessage(bytes).controller), [
+        99,
+        98,
+        97,
+      ]);
+      expect(incrementSequence.map((bytes) => MidiMessage(bytes).value), [
+        9,
+        82,
+        2,
+      ]);
+    });
+  });
+
   group('Message type mutual exclusivity', () {
     test('each message type is exclusively identified', () {
       final messages = <String, MidiMessage>{

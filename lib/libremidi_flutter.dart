@@ -5,7 +5,7 @@ import 'dart:convert' show utf8;
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:async' show StreamController;
+import 'dart:async' show Stream, StreamController;
 
 import 'package:ffi/ffi.dart';
 
@@ -281,6 +281,245 @@ class MidiMessage {
   String toString() {
     final hex = data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
     return 'MidiMessage($hex)';
+  }
+}
+
+// =============================================================================
+// RPN / NRPN parsing
+// =============================================================================
+
+/// The type of parameter number message represented by [RpnNrpnMessage].
+enum RpnNrpnType {
+  /// Registered Parameter Number (RPN), selected with CC 101/100.
+  rpn,
+
+  /// Non-Registered Parameter Number (NRPN), selected with CC 99/98.
+  nrpn,
+}
+
+/// The kind of RPN/NRPN data change represented by [RpnNrpnMessage].
+enum RpnNrpnChangeType {
+  /// Absolute Data Entry value from CC 6 and optional CC 38.
+  value,
+
+  /// Relative Data Increment from CC 96.
+  increment,
+
+  /// Relative Data Decrement from CC 97.
+  decrement,
+}
+
+/// A decoded RPN or NRPN value from a Control Change sequence.
+///
+/// RPN and NRPN are not single MIDI messages. They are decoded from a sequence
+/// of Control Change messages that select a parameter and then send Data Entry
+/// values or increments/decrements. [source] is the Control Change message that
+/// completed this decoded event (usually CC 6, CC 38, CC 96, or CC 97).
+class RpnNrpnMessage {
+  final RpnNrpnType type;
+  final RpnNrpnChangeType changeType;
+  final int channel;
+  final int parameter;
+  final int value;
+  final bool fourteenBit;
+  final MidiMessage source;
+
+  const RpnNrpnMessage({
+    required this.type,
+    this.changeType = RpnNrpnChangeType.value,
+    required this.channel,
+    required this.parameter,
+    required this.value,
+    required this.fourteenBit,
+    required this.source,
+  });
+
+  @override
+  String toString() =>
+      'RpnNrpnMessage(${type.name}, ${changeType.name}, channel: $channel, parameter: $parameter, value: $value, fourteenBit: $fourteenBit)';
+}
+
+class _RpnNrpnChannelState {
+  RpnNrpnType? selectedType;
+  int? rpnMsb;
+  int? rpnLsb;
+  int? nrpnMsb;
+  int? nrpnLsb;
+  int? dataMsb;
+
+  int? get selectedParameter {
+    switch (selectedType) {
+      case RpnNrpnType.rpn:
+        final msb = rpnMsb;
+        final lsb = rpnLsb;
+        return msb == null || lsb == null ? null : (msb << 7) | lsb;
+      case RpnNrpnType.nrpn:
+        final msb = nrpnMsb;
+        final lsb = nrpnLsb;
+        return msb == null || lsb == null ? null : (msb << 7) | lsb;
+      case null:
+        return null;
+    }
+  }
+
+  void selectRpn() {
+    selectedType = RpnNrpnType.rpn;
+    nrpnMsb = null;
+    nrpnLsb = null;
+    dataMsb = null;
+  }
+
+  void selectNrpn() {
+    selectedType = RpnNrpnType.nrpn;
+    rpnMsb = null;
+    rpnLsb = null;
+    dataMsb = null;
+  }
+
+  void deselectRpnIfNullFunction() {
+    if (rpnMsb == 127 && rpnLsb == 127) {
+      selectedType = selectedType == RpnNrpnType.rpn ? null : selectedType;
+      rpnMsb = null;
+      rpnLsb = null;
+      dataMsb = null;
+    }
+  }
+
+  void deselectNrpnIfNullFunction() {
+    if (nrpnMsb == 127 && nrpnLsb == 127) {
+      selectedType = selectedType == RpnNrpnType.nrpn ? null : selectedType;
+      nrpnMsb = null;
+      nrpnLsb = null;
+      dataMsb = null;
+    }
+  }
+}
+
+/// Stateful decoder for incoming RPN and NRPN Control Change sequences.
+///
+/// MIDI keeps RPN/NRPN selection state per channel, so use one parser instance
+/// for each MIDI input stream you want to decode. The parser emits a 7-bit
+/// event when CC 6 (Data Entry MSB) arrives, a 14-bit refinement when CC 38
+/// (Data Entry LSB) follows for the same selected parameter, and relative
+/// increment/decrement events when CC 96/97 arrive.
+class RpnNrpnParser {
+  final List<_RpnNrpnChannelState> _states = List.generate(
+    16,
+    (_) => _RpnNrpnChannelState(),
+  );
+
+  /// Processes one MIDI message and returns a decoded RPN/NRPN event if the
+  /// message completes one.
+  RpnNrpnMessage? process(MidiMessage message) {
+    if (!message.isControlChange || message.data.length < 3) return null;
+
+    final state = _states[message.channel];
+    final controller = message.controller;
+    final value = message.value;
+
+    switch (controller) {
+      case 101: // RPN MSB
+        state.selectRpn();
+        state.rpnMsb = value;
+        state.deselectRpnIfNullFunction();
+        return null;
+      case 100: // RPN LSB
+        state.selectRpn();
+        state.rpnLsb = value;
+        state.deselectRpnIfNullFunction();
+        return null;
+      case 99: // NRPN MSB
+        state.selectNrpn();
+        state.nrpnMsb = value;
+        state.deselectNrpnIfNullFunction();
+        return null;
+      case 98: // NRPN LSB
+        state.selectNrpn();
+        state.nrpnLsb = value;
+        state.deselectNrpnIfNullFunction();
+        return null;
+      case 6: // Data Entry MSB
+        return _emitDataMsb(state, message, value);
+      case 38: // Data Entry LSB
+        return _emitDataLsb(state, message, value);
+      case 96: // Data Increment
+        return _emitRelativeChange(
+          state,
+          message,
+          value,
+          RpnNrpnChangeType.increment,
+        );
+      case 97: // Data Decrement
+        return _emitRelativeChange(
+          state,
+          message,
+          value,
+          RpnNrpnChangeType.decrement,
+        );
+      default:
+        return null;
+    }
+  }
+
+  RpnNrpnMessage? _emitDataMsb(
+    _RpnNrpnChannelState state,
+    MidiMessage source,
+    int value,
+  ) {
+    final type = state.selectedType;
+    final parameter = state.selectedParameter;
+    if (type == null || parameter == null) return null;
+
+    state.dataMsb = value;
+    return RpnNrpnMessage(
+      type: type,
+      channel: source.channel,
+      parameter: parameter,
+      value: value,
+      fourteenBit: false,
+      source: source,
+    );
+  }
+
+  RpnNrpnMessage? _emitDataLsb(
+    _RpnNrpnChannelState state,
+    MidiMessage source,
+    int value,
+  ) {
+    final type = state.selectedType;
+    final parameter = state.selectedParameter;
+    final dataMsb = state.dataMsb;
+    if (type == null || parameter == null || dataMsb == null) return null;
+
+    return RpnNrpnMessage(
+      type: type,
+      channel: source.channel,
+      parameter: parameter,
+      value: (dataMsb << 7) | value,
+      fourteenBit: true,
+      source: source,
+    );
+  }
+
+  RpnNrpnMessage? _emitRelativeChange(
+    _RpnNrpnChannelState state,
+    MidiMessage source,
+    int value,
+    RpnNrpnChangeType changeType,
+  ) {
+    final type = state.selectedType;
+    final parameter = state.selectedParameter;
+    if (type == null || parameter == null) return null;
+
+    return RpnNrpnMessage(
+      type: type,
+      changeType: changeType,
+      channel: source.channel,
+      parameter: parameter,
+      value: value,
+      fourteenBit: false,
+      source: source,
+    );
   }
 }
 
@@ -664,6 +903,222 @@ class MidiOutput {
     sendProgramChange(channel: channel, program: program);
   }
 
+  /// Sends a Registered Parameter Number (RPN) value.
+  ///
+  /// RPN uses a standard Control Change sequence:
+  /// CC 101/100 select the parameter, CC 6 sets the value MSB, and CC 38
+  /// optionally sets the value LSB for 14-bit values. When [deselect] is true,
+  /// the RPN parameter is cleared afterwards with CC 101/100 = 127.
+  ///
+  /// With [fourteenBit] true, [value] must be 0..16383. With [fourteenBit]
+  /// false, [value] must be 0..127 and only CC 6 is sent for the value.
+  void sendRpn({
+    required int channel,
+    required int parameter,
+    required int value,
+    bool fourteenBit = true,
+    bool deselect = true,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(
+      value,
+      0,
+      fourteenBit ? 16383 : 127,
+      'value',
+    );
+
+    final parameterMsb = (parameter >> 7) & 0x7F;
+    final parameterLsb = parameter & 0x7F;
+    sendControlChange(channel: channel, controller: 101, value: parameterMsb);
+    sendControlChange(channel: channel, controller: 100, value: parameterLsb);
+
+    if (fourteenBit) {
+      final valueMsb = (value >> 7) & 0x7F;
+      final valueLsb = value & 0x7F;
+      sendControlChange(channel: channel, controller: 6, value: valueMsb);
+      sendControlChange(channel: channel, controller: 38, value: valueLsb);
+    } else {
+      sendControlChange(channel: channel, controller: 6, value: value);
+    }
+
+    if (deselect) {
+      sendControlChange(channel: channel, controller: 101, value: 127);
+      sendControlChange(channel: channel, controller: 100, value: 127);
+    }
+  }
+
+  /// Sends a Data Increment for a Registered Parameter Number (RPN).
+  ///
+  /// Sends the RPN parameter select sequence followed by CC 96. [amount] is the
+  /// raw 7-bit value byte for CC 96; many devices ignore it or interpret it as
+  /// a step amount.
+  void incrementRpn({
+    required int channel,
+    required int parameter,
+    int amount = 1,
+    bool deselect = true,
+  }) {
+    _sendRpnRelative(
+      channel: channel,
+      parameter: parameter,
+      controller: 96,
+      amount: amount,
+      deselect: deselect,
+    );
+  }
+
+  /// Sends a Data Decrement for a Registered Parameter Number (RPN).
+  ///
+  /// Sends the RPN parameter select sequence followed by CC 97. [amount] is the
+  /// raw 7-bit value byte for CC 97; many devices ignore it or interpret it as
+  /// a step amount.
+  void decrementRpn({
+    required int channel,
+    required int parameter,
+    int amount = 1,
+    bool deselect = true,
+  }) {
+    _sendRpnRelative(
+      channel: channel,
+      parameter: parameter,
+      controller: 97,
+      amount: amount,
+      deselect: deselect,
+    );
+  }
+
+  /// Sends a Non-Registered Parameter Number (NRPN) value.
+  ///
+  /// NRPN uses a Control Change sequence:
+  /// CC 99/98 select the parameter, CC 6 sets the value MSB, and CC 38
+  /// optionally sets the value LSB for 14-bit values. When [deselect] is true,
+  /// the NRPN parameter is cleared afterwards with CC 99/98 = 127.
+  ///
+  /// With [fourteenBit] true, [value] must be 0..16383. With [fourteenBit]
+  /// false, [value] must be 0..127 and only CC 6 is sent for the value.
+  void sendNrpn({
+    required int channel,
+    required int parameter,
+    required int value,
+    bool fourteenBit = true,
+    bool deselect = true,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(
+      value,
+      0,
+      fourteenBit ? 16383 : 127,
+      'value',
+    );
+
+    final parameterMsb = (parameter >> 7) & 0x7F;
+    final parameterLsb = parameter & 0x7F;
+    sendControlChange(channel: channel, controller: 99, value: parameterMsb);
+    sendControlChange(channel: channel, controller: 98, value: parameterLsb);
+
+    if (fourteenBit) {
+      final valueMsb = (value >> 7) & 0x7F;
+      final valueLsb = value & 0x7F;
+      sendControlChange(channel: channel, controller: 6, value: valueMsb);
+      sendControlChange(channel: channel, controller: 38, value: valueLsb);
+    } else {
+      sendControlChange(channel: channel, controller: 6, value: value);
+    }
+
+    if (deselect) {
+      sendControlChange(channel: channel, controller: 99, value: 127);
+      sendControlChange(channel: channel, controller: 98, value: 127);
+    }
+  }
+
+  /// Sends a Data Increment for a Non-Registered Parameter Number (NRPN).
+  ///
+  /// Sends the NRPN parameter select sequence followed by CC 96. [amount] is
+  /// the raw 7-bit value byte for CC 96; many devices ignore it or interpret it
+  /// as a step amount.
+  void incrementNrpn({
+    required int channel,
+    required int parameter,
+    int amount = 1,
+    bool deselect = true,
+  }) {
+    _sendNrpnRelative(
+      channel: channel,
+      parameter: parameter,
+      controller: 96,
+      amount: amount,
+      deselect: deselect,
+    );
+  }
+
+  /// Sends a Data Decrement for a Non-Registered Parameter Number (NRPN).
+  ///
+  /// Sends the NRPN parameter select sequence followed by CC 97. [amount] is
+  /// the raw 7-bit value byte for CC 97; many devices ignore it or interpret it
+  /// as a step amount.
+  void decrementNrpn({
+    required int channel,
+    required int parameter,
+    int amount = 1,
+    bool deselect = true,
+  }) {
+    _sendNrpnRelative(
+      channel: channel,
+      parameter: parameter,
+      controller: 97,
+      amount: amount,
+      deselect: deselect,
+    );
+  }
+
+  void _sendRpnRelative({
+    required int channel,
+    required int parameter,
+    required int controller,
+    required int amount,
+    required bool deselect,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(amount, 0, 127, 'amount');
+
+    final parameterMsb = (parameter >> 7) & 0x7F;
+    final parameterLsb = parameter & 0x7F;
+    sendControlChange(channel: channel, controller: 101, value: parameterMsb);
+    sendControlChange(channel: channel, controller: 100, value: parameterLsb);
+    sendControlChange(channel: channel, controller: controller, value: amount);
+
+    if (deselect) {
+      sendControlChange(channel: channel, controller: 101, value: 127);
+      sendControlChange(channel: channel, controller: 100, value: 127);
+    }
+  }
+
+  void _sendNrpnRelative({
+    required int channel,
+    required int parameter,
+    required int controller,
+    required int amount,
+    required bool deselect,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(amount, 0, 127, 'amount');
+
+    final parameterMsb = (parameter >> 7) & 0x7F;
+    final parameterLsb = parameter & 0x7F;
+    sendControlChange(channel: channel, controller: 99, value: parameterMsb);
+    sendControlChange(channel: channel, controller: 98, value: parameterLsb);
+    sendControlChange(channel: channel, controller: controller, value: amount);
+
+    if (deselect) {
+      sendControlChange(channel: channel, controller: 99, value: 127);
+      sendControlChange(channel: channel, controller: 98, value: 127);
+    }
+  }
+
   /// Sends a SysEx message.
   ///
   /// By default, [data] should NOT include 0xF0/0xF7 framing bytes - they
@@ -777,6 +1232,19 @@ class MidiInput {
   /// SysEx dumps), messages will queue in memory. Consider using
   /// [messagesFiltered] or processing messages efficiently.
   Stream<MidiMessage> get messages => _messageController.stream;
+
+  /// Stream of decoded RPN / NRPN messages.
+  ///
+  /// The raw Control Change messages remain available through [messages]. This
+  /// stream creates a parser for the returned stream and emits parameter events
+  /// when a CC sequence selects an RPN/NRPN parameter and sends Data Entry.
+  Stream<RpnNrpnMessage> get rpnNrpnMessages {
+    final parser = RpnNrpnParser();
+    return _messageController.stream.expand((msg) {
+      final event = parser.process(msg);
+      return event == null ? const <RpnNrpnMessage>[] : [event];
+    });
+  }
 
   /// Stream of incoming MIDI messages with optional filtering.
   ///

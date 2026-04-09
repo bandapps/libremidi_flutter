@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.4
+
+### Added
+
+- Add RPN and NRPN input/output support with 7-bit and 14-bit Data Entry, Data Increment/Decrement, optional output deselection, and decoded input parsing.
+
 ## 0.8.3
 
 ### Added
