@@ -8,8 +8,10 @@
 #define LIBREMIDI_COREMIDI 1
 
 #include <libremidi/libremidi.hpp>
+#include <libremidi/port_comparison.hpp>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -218,9 +220,22 @@ struct LrmMidiIn {
         config.ignore_timing = !receive_timing;
         config.ignore_sensing = !receive_sensing;
         config.on_message = [this](const libremidi::message& msg) {
-            if (callback) {
-                callback(context, msg.bytes.data(), msg.bytes.size(), msg.timestamp);
-            }
+            if (!callback)
+                return;
+            const size_t size = msg.bytes.size();
+            if (size == 0)
+                return;
+            // libremidi reuses a single message buffer: it is cleared as soon as
+            // this synchronous callback returns and overwritten for every further
+            // message in the same packet. The Dart side is a
+            // NativeCallable.listener that reads the bytes later on the event
+            // loop, so hand it an owning heap copy and let it release the copy
+            // via lrm_free once it has been read.
+            auto* copy = static_cast<uint8_t*>(std::malloc(size));
+            if (!copy)
+                return;
+            std::memcpy(copy, msg.bytes.data(), size);
+            callback(context, copy, size, msg.timestamp);
         };
 
         midi_in = std::make_unique<libremidi::midi_in>(std::move(config));
@@ -243,6 +258,12 @@ struct LrmMidiOut {
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
     return "0.8.4";
+}
+
+// Free a heap buffer handed to Dart by the input callback. Uses the library's
+// own allocator so the caller does not depend on a matching C runtime.
+extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
+    std::free(ptr);
 }
 
 // =============================================================================
@@ -365,6 +386,40 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observ
 
     fill_port_info(port, index, false, info);
     return LRM_OK;
+}
+
+// =============================================================================
+// Fuzzy Port Matching (libremidi heuristic matcher)
+// =============================================================================
+
+template<typename PortType>
+static int32_t find_closest_port_impl(
+    const std::vector<PortType>& ports, const LrmPortInfo* saved) {
+    if (!saved || ports.empty()) return -1;
+
+    PortType target{};
+    target.port_name = saved->port_name;
+    target.device_name = saved->device_name;
+    target.display_name = saved->display_name;
+    target.manufacturer = saved->manufacturer;
+    target.product = saved->product;
+    target.serial = saved->serial;
+
+    auto result = libremidi::find_closest_port(
+        target, std::span<const PortType>{ports.data(), ports.size()});
+
+    if (!result.found) return -1;
+    return static_cast<int32_t>(result.port - ports.data());
+}
+
+extern "C" FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
+    LrmObserver* observer, const LrmPortInfo* saved, bool is_input) {
+    if (!observer || !saved) return -1;
+    if (is_input) {
+        return find_closest_port_impl(observer->input_ports, saved);
+    } else {
+        return find_closest_port_impl(observer->output_ports, saved);
+    }
 }
 
 // =============================================================================
