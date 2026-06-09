@@ -43,6 +43,15 @@ void main() {
             .firstMatch(readFromRoot('apple/Classes/libremidi_flutter.cpp'))
             ?.group(1);
 
+    // CocoaPods podspecs (iOS + macOS): s.version = 'x.y.z'
+    final podspecVersionRe = RegExp(r"s\.version\s*=\s*'([^']+)'");
+    final iosPodspecVersion = podspecVersionRe
+        .firstMatch(readFromRoot('ios/libremidi_flutter.podspec'))
+        ?.group(1);
+    final macosPodspecVersion = podspecVersionRe
+        .firstMatch(readFromRoot('macos/libremidi_flutter.podspec'))
+        ?.group(1);
+
     expect(pubspecVersion, isNotNull,
         reason: 'could not parse version from pubspec.yaml');
     expect(srcVersion, isNotNull,
@@ -59,5 +68,11 @@ void main() {
         reason: 'version drift: apple/Classes/libremidi_flutter.cpp '
             'lrm_get_version() ($appleVersion) != pubspec ($pubspecVersion) — '
             'update the Apple return literal when bumping the version.');
+    expect(iosPodspecVersion, pubspecVersion,
+        reason: 'version drift: ios/libremidi_flutter.podspec '
+            '($iosPodspecVersion) != pubspec ($pubspecVersion).');
+    expect(macosPodspecVersion, pubspecVersion,
+        reason: 'version drift: macos/libremidi_flutter.podspec '
+            '($macosPodspecVersion) != pubspec ($pubspecVersion).');
   });
 }

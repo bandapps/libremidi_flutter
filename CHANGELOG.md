@@ -12,8 +12,7 @@
 
 ### Changed
 
-- **Breaking (Apple build config only — no Dart code changes):** iOS and macOS are now integrated via Swift Package Manager only; the CocoaPods podspecs have been removed. Apps that still use CocoaPods must enable Swift Package Manager.
-- Merge the separate iOS and macOS native sources into a single shared Apple implementation, and remove debug logging from the Apple backend.
+- Remove `[libremidi]` debug logging from the Apple (iOS/macOS) native backend.
 
 ## 0.8.4
 

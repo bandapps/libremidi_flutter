@@ -292,7 +292,6 @@ observer.dispose();
 
 ## Notes
 
-- **Apple (iOS/macOS):** integrated via Swift Package Manager only — the plugin no longer ships CocoaPods podspecs. Apps whose iOS/macOS build still uses CocoaPods must enable Swift Package Manager.
 - **Android BLE MIDI:** connecting to Bluetooth MIDI on Android 12+ requires the `BLUETOOTH_CONNECT` runtime permission. The plugin declares it in its manifest, but the app must request it at runtime (e.g. via `permission_handler`) before using BLE devices.
 - BLE MIDI requires native platform integration
 - See the bundled `example/` app for device selection, port selection, hotplug handling, MIDI input logs, and common output message types.
