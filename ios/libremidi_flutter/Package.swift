@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "libremidi_flutter",
     platforms: [
-        .iOS(.v13)
+        .iOS(.v14)
     ],
     products: [
         .library(name: "libremidi-flutter", targets: ["libremidi_flutter"])
