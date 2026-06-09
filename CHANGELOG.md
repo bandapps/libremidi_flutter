@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.5
+
+### Added
+
+- Add fuzzy port matching to re-resolve a saved port across reconnects, driver updates, or USB-port changes: `LibremidiFlutter.findClosestInputPort` / `findClosestOutputPort`, `MidiObserver.findClosestPort`, and `MidiPort.toMatchJson` / `MidiPort.fromMatchJson` for persisting and restoring a selection.
+
+### Fixed
+
+- Fix a use-after-free in the MIDI input callback that could drop or corrupt incoming messages — or crash — under dense input or large SysEx. Message bytes are now copied synchronously on the native side before being delivered to Dart.
+
+### Changed
+
+- **Breaking (Apple build config only — no Dart code changes):** iOS and macOS are now integrated via Swift Package Manager only; the CocoaPods podspecs have been removed. Apps that still use CocoaPods must enable Swift Package Manager.
+- Merge the separate iOS and macOS native sources into a single shared Apple implementation, and remove debug logging from the Apple backend.
+
 ## 0.8.4
 
 ### Added

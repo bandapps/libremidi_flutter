@@ -251,7 +251,7 @@ struct LrmMidiOut {
 // =============================================================================
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
-    return "0.8.4";
+    return "0.8.5";
 }
 
 // Free a heap buffer handed to Dart by the input callback. Uses the library's
