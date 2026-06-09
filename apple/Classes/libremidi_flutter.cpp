@@ -1,11 +1,15 @@
-// iOS implementation - same as macOS (both use CoreMIDI)
-// Uses MIDIClientCreateWithBlock for hotplug notifications (GCD-based, works with Flutter)
-
+// Shared Apple (iOS + macOS) CoreMIDI implementation.
+// Both platforms compile this single file via their SwiftPM targets
+// (ios/ and macos/ Sources symlink here). Uses MIDIClientCreateWithBlock for
+// hotplug notifications (GCD-based, works with Flutter's run loop).
 #include "libremidi_flutter.h"
 
 // Enable header-only mode and CoreMIDI backend
 #define LIBREMIDI_HEADER_ONLY 1
-#define LIBREMIDI_COREMIDI 1
+
+#if defined(__APPLE__)
+  #define LIBREMIDI_COREMIDI 1
+#endif
 
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
@@ -18,9 +22,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <dispatch/dispatch.h>
+#endif
 
 // =============================================================================
 // Internal structures using Generic API
@@ -36,10 +42,12 @@
 // Forward declaration
 struct LrmObserver;
 
+#if defined(__APPLE__)
 // We use MIDIClientCreateWithBlock because it delivers notifications via dispatch queue
 // instead of CFRunLoop. This is the same approach used by FlutterMidiCommand and works
 // properly with Flutter's event loop.
 static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification);
+#endif
 
 struct LrmObserver {
     std::unique_ptr<libremidi::observer> observer;
@@ -47,16 +55,23 @@ struct LrmObserver {
     std::vector<libremidi::output_port> output_ports;
     LrmHotplugCallback hotplug_callback;
     void* hotplug_context;
-    MIDIClientRef midiClient;
-    dispatch_queue_t refreshQueue;
     mutable std::mutex ports_mutex;
 
+#if defined(__APPLE__)
+    MIDIClientRef midiClient;
+    dispatch_queue_t refreshQueue;
+#endif
+
     LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
-        : hotplug_callback(callback), hotplug_context(context), midiClient(0)
+        : hotplug_callback(callback), hotplug_context(context)
+#if defined(__APPLE__)
+        , midiClient(0)
         , refreshQueue(dispatch_queue_create("dev.celtera.libremidi.refresh", DISPATCH_QUEUE_SERIAL))
+#endif
     {
         printf("[libremidi] Creating observer, callback=%p\n", (void*)callback);
 
+#if defined(__APPLE__)
         if (hotplug_callback) {
             // Create our own MIDI client using MIDIClientCreateWithBlock
             // This delivers notifications via dispatch queue (works with Flutter)
@@ -75,14 +90,15 @@ struct LrmObserver {
                 printf("[libremidi] MIDIClientCreateWithBlock succeeded, client=%u\n", (unsigned)midiClient);
             }
         }
+#endif
 
-        // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves)
+        // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves on macOS)
         libremidi::observer_configuration config;
         config.track_hardware = true;
         config.track_virtual = true;
         config.notify_in_constructor = false;
 
-        // Don't set callbacks - we use our own MIDIClient for notifications
+        // Don't set callbacks - we use our own MIDIClient for notifications on macOS
         observer = std::make_unique<libremidi::observer>(std::move(config));
         printf("[libremidi] Observer created successfully\n");
         refreshInternal();
@@ -92,6 +108,7 @@ struct LrmObserver {
     ~LrmObserver() {
         // Prevent late callbacks during/after dispose
         hotplug_callback = nullptr;
+#if defined(__APPLE__)
         if (midiClient) {
             MIDIClientDispose(midiClient);
             midiClient = 0;
@@ -99,15 +116,21 @@ struct LrmObserver {
         // Drain pending blocks before freeing — prevents use-after-free
         // if a hotplug notification was dispatched just before dispose.
         dispatch_sync(refreshQueue, ^{});
+#endif
     }
 
     /// Refresh + notify on a background queue to avoid blocking the main
     /// thread (CoreMIDI delivers notifications on the main RunLoop).
     void refreshAndNotifyAsync(int eventType) {
+#if defined(__APPLE__)
         dispatch_async(refreshQueue, ^{
             refreshInternal();
             notifyHotplug(eventType);
         });
+#else
+        refreshInternal();
+        notifyHotplug(eventType);
+#endif
     }
 
     void refreshInternal() {
@@ -169,6 +192,7 @@ struct LrmObserver {
     }
 };
 
+#if defined(__APPLE__)
 static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification) {
     // CoreMIDI delivers notifications on the main thread RunLoop.
     // We must not call get_input_ports()/get_output_ports() here because
@@ -205,6 +229,7 @@ static void handleMIDINotification(LrmObserver* obs, const MIDINotification* not
             break;
     }
 }
+#endif
 
 struct LrmMidiIn {
     std::unique_ptr<libremidi::midi_in> midi_in;
@@ -245,11 +270,24 @@ struct LrmMidiIn {
 
 struct LrmMidiOut {
     std::unique_ptr<libremidi::midi_out> midi_out;
+    int64_t port_id{0};
 
-    LrmMidiOut(libremidi::output_port& port) {
+    LrmMidiOut() = default;
+
+    LrmMidiOut(libremidi::output_port& port)
+        : port_id(static_cast<int64_t>(static_cast<int32_t>(port.port)))
+    {
         midi_out = std::make_unique<libremidi::midi_out>();
         midi_out->open_port(port);
     }
+
+    virtual void sendRaw(const uint8_t* data, size_t len) {
+        if (midi_out) {
+            try { midi_out->send_message(data, len); } catch (...) {}
+        }
+    }
+
+    virtual ~LrmMidiOut() = default;
 };
 
 // =============================================================================

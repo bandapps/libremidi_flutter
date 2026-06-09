@@ -9,11 +9,15 @@ let package = Package(
     products: [
         .library(name: "libremidi-flutter", targets: ["libremidi_flutter"])
     ],
-    dependencies: [],
+    dependencies: [
+        .package(name: "FlutterFramework", path: "../FlutterFramework")
+    ],
     targets: [
         .target(
             name: "libremidi_flutter",
-            dependencies: [],
+            dependencies: [
+                .product(name: "FlutterFramework", package: "FlutterFramework")
+            ],
             path: "Sources/libremidi_flutter",
             sources: ["libremidi_flutter.cpp"],
             publicHeadersPath: "include/libremidi_flutter",
