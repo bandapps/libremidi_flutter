@@ -131,6 +131,12 @@ FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input(LrmObserver* observer, int32_t 
 // Get output port info by index (returns 0 on success, fills info struct)
 FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observer, int32_t index, LrmPortInfo* info);
 
+// Find the closest matching port using heuristic fuzzy matching.
+// Takes a saved LrmPortInfo and searches current ports for the best match.
+// Returns the port index (>= 0) on success, or -1 if no match found.
+FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
+    LrmObserver* observer, const LrmPortInfo* saved, bool is_input);
+
 // =============================================================================
 // MIDI Output API
 // =============================================================================

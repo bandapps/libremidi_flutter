@@ -175,6 +175,26 @@ class LibremidiFlutterBindings {
   late final _lrm_observer_get_output = _lrm_observer_get_outputPtr.asFunction<
       int Function(ffi.Pointer<LrmObserver>, int, ffi.Pointer<LrmPortInfo>)>();
 
+  /// Find the closest matching port using heuristic fuzzy matching.
+  /// Returns the port index (>= 0) on success, or -1 if no match found.
+  int lrm_find_closest_port(
+    ffi.Pointer<LrmObserver> observer,
+    ffi.Pointer<LrmPortInfo> saved,
+    bool is_input,
+  ) {
+    return _lrm_find_closest_port(observer, saved, is_input);
+  }
+
+  late final _lrm_find_closest_portPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+            ffi.Pointer<LrmObserver>,
+            ffi.Pointer<LrmPortInfo>,
+            ffi.Bool,
+          )>>('lrm_find_closest_port');
+  late final _lrm_find_closest_port = _lrm_find_closest_portPtr.asFunction<
+      int Function(ffi.Pointer<LrmObserver>, ffi.Pointer<LrmPortInfo>, bool)>();
+
   /// Open a MIDI output port by index
   ffi.Pointer<LrmMidiOut> lrm_midi_out_open(
     ffi.Pointer<LrmObserver> observer,

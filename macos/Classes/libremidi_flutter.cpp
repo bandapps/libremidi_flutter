@@ -8,6 +8,7 @@
 #endif
 
 #include <libremidi/libremidi.hpp>
+#include <libremidi/port_comparison.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -419,6 +420,40 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observ
 
     fill_port_info(port, index, false, info);
     return LRM_OK;
+}
+
+// =============================================================================
+// Fuzzy Port Matching (libremidi heuristic matcher)
+// =============================================================================
+
+template<typename PortType>
+static int32_t find_closest_port_impl(
+    const std::vector<PortType>& ports, const LrmPortInfo* saved) {
+    if (!saved || ports.empty()) return -1;
+
+    PortType target{};
+    target.port_name = saved->port_name;
+    target.device_name = saved->device_name;
+    target.display_name = saved->display_name;
+    target.manufacturer = saved->manufacturer;
+    target.product = saved->product;
+    target.serial = saved->serial;
+
+    auto result = libremidi::find_closest_port(
+        target, std::span<const PortType>{ports.data(), ports.size()});
+
+    if (!result.found) return -1;
+    return static_cast<int32_t>(result.port - ports.data());
+}
+
+extern "C" FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
+    LrmObserver* observer, const LrmPortInfo* saved, bool is_input) {
+    if (!observer || !saved) return -1;
+    if (is_input) {
+        return find_closest_port_impl(observer->input_ports, saved);
+    } else {
+        return find_closest_port_impl(observer->output_ports, saved);
+    }
 }
 
 // =============================================================================

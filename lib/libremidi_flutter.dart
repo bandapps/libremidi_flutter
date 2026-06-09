@@ -195,6 +195,45 @@ class MidiPort {
         'is_virtual': isVirtual,
       };
 
+  /// Serializes only the fields needed for fuzzy matching to a JSON-compatible
+  /// map. Persist this to later restore a port with [findClosestPort].
+  Map<String, String> toMatchJson() => {
+        'display_name': displayName,
+        'port_name': portName,
+        'device_name': deviceName,
+        'manufacturer': manufacturer,
+        'product': product,
+        'serial': serial,
+      };
+
+  /// Reconstructs a [MidiPort] from a [toMatchJson] map for fuzzy matching.
+  ///
+  /// Only the matching-relevant string fields are restored; all other fields
+  /// are set to defaults. Returns null if the map is null or carries no usable
+  /// identifying information.
+  static MidiPort? fromMatchJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final portName = json['port_name'] as String? ?? '';
+    final displayName = json['display_name'] as String? ?? '';
+    if (portName.isEmpty && displayName.isEmpty) return null;
+    return MidiPort._(
+      stableId: 0,
+      portId: 0,
+      clientHandle: 0,
+      index: -1,
+      displayName: displayName,
+      portName: portName,
+      deviceName: json['device_name'] as String? ?? '',
+      manufacturer: json['manufacturer'] as String? ?? '',
+      product: json['product'] as String? ?? '',
+      serial: json['serial'] as String? ?? '',
+      transportType: MidiTransportType.unknown,
+      rawTransportType: 0,
+      isInput: false,
+      isVirtual: false,
+    );
+  }
+
   @override
   String toString() =>
       'MidiPort($displayName, ${isInput ? "input" : "output"}, ${transportType.displayName})';
@@ -749,6 +788,24 @@ class MidiObserver {
     _bindings.lrm_observer_refresh(_handle!);
   }
 
+  /// Finds the closest matching port using libremidi's heuristic fuzzy matcher.
+  ///
+  /// Pass a [MidiPort] describing the wanted device (e.g. restored via
+  /// [MidiPort.fromMatchJson]) and whether to search inputs or outputs. Returns
+  /// the index into the current port list (>= 0) on success, or -1 if no match
+  /// was found. The match tolerates driver updates, USB-port changes and
+  /// WinMM→WinMIDI migration better than an exact id.
+  int findClosestPort(MidiPort port, {required bool isInput}) {
+    _checkDisposed();
+    final info = calloc<LrmPortInfo>();
+    try {
+      _fillPortInfo(info.ref, port);
+      return _bindings.lrm_find_closest_port(_handle!, info, isInput);
+    } finally {
+      calloc.free(info);
+    }
+  }
+
   /// Disposes the observer and releases resources.
   void dispose() {
     if (!_disposed && _handle != null) {
@@ -774,6 +831,29 @@ class MidiObserver {
       bytes.add(byte & 0xFF);
     }
     return utf8.decode(bytes, allowMalformed: true);
+  }
+
+  /// Writes a [MidiPort]'s matching-relevant string fields into a native
+  /// [LrmPortInfo] struct for [findClosestPort]. Numeric fields are left as
+  /// zeroed by the caller's `calloc`.
+  static void _fillPortInfo(LrmPortInfo info, MidiPort port) {
+    _stringToArray(info.display_name, port.displayName, 256);
+    _stringToArray(info.port_name, port.portName, 256);
+    _stringToArray(info.device_name, port.deviceName, 256);
+    _stringToArray(info.manufacturer, port.manufacturer, 256);
+    _stringToArray(info.product, port.product, 256);
+    _stringToArray(info.serial, port.serial, 128);
+  }
+
+  /// Writes a Dart string into a fixed-size native char array as UTF-8,
+  /// truncating to fit and always null-terminating.
+  static void _stringToArray(Array<Char> array, String value, int maxLength) {
+    final bytes = utf8.encode(value);
+    final len = bytes.length < maxLength - 1 ? bytes.length : maxLength - 1;
+    for (var i = 0; i < len; i++) {
+      array[i] = bytes[i];
+    }
+    array[len] = 0; // null terminator
   }
 }
 
@@ -1340,6 +1420,16 @@ class LibremidiFlutter {
   static List<MidiPort> getOutputPorts() {
     return _ensureObserver.getOutputPorts();
   }
+
+  /// Finds the closest matching output port using fuzzy heuristic matching.
+  /// Returns the port index (>= 0) or -1 if no match.
+  static int findClosestOutputPort(MidiPort port) =>
+      _ensureObserver.findClosestPort(port, isInput: false);
+
+  /// Finds the closest matching input port using fuzzy heuristic matching.
+  /// Returns the port index (>= 0) or -1 if no match.
+  static int findClosestInputPort(MidiPort port) =>
+      _ensureObserver.findClosestPort(port, isInput: true);
 
   /// Opens a MIDI output connection to the specified port.
   ///
