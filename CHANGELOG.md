@@ -10,10 +10,6 @@
 
 - Fix a use-after-free in the MIDI input callback that could drop or corrupt incoming messages — or crash — under dense input or large SysEx. Message bytes are now copied synchronously on the native side before being delivered to Dart.
 
-### Changed
-
-- Remove `[libremidi]` debug logging from the Apple (iOS/macOS) native backend.
-
 ## 0.8.4
 
 ### Added
