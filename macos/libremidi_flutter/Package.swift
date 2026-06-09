@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "libremidi_flutter",
     platforms: [
-        .macOS(.v11)
+        .macOS(.v10_15)
     ],
     products: [
         .library(name: "libremidi-flutter", targets: ["libremidi_flutter"])
@@ -26,7 +26,13 @@ let package = Package(
                 .define("LIBREMIDI_COREMIDI", to: "1"),
                 .headerSearchPath("include/libremidi_flutter"),
                 .headerSearchPath("libremidi_headers"),
-                .unsafeFlags(["-std=c++20"])
+                // libremidi's CoreMIDI backend pulls in the coremidi_ump
+                // (MIDI 2.0) backend, which references macOS 11 / iOS 14 APIs.
+                // That backend is never instantiated here (we only use the
+                // MIDI 1 CoreMIDI API), so the unguarded-availability warnings
+                // are about dead code — silence them to keep the iOS 13 /
+                // macOS 10.15 deployment targets.
+                .unsafeFlags(["-std=c++20", "-Wno-unguarded-availability-new"])
             ],
             linkerSettings: [
                 .linkedFramework("CoreMIDI"),
