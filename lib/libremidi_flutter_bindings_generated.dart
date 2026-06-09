@@ -29,8 +29,9 @@ class LibremidiFlutterBindings {
 
   /// The symbols are looked up with [lookup].
   LibremidiFlutterBindings.fromLookup(
-    ffi.Pointer<T> Function<T extends ffi.NativeType>(String symbolName) lookup,
-  ) : _lookup = lookup;
+      ffi.Pointer<T> Function<T extends ffi.NativeType>(String symbolName)
+          lookup)
+      : _lookup = lookup;
 
   /// Get library version string
   ffi.Pointer<ffi.Char> lrm_get_version() {
@@ -39,10 +40,25 @@ class LibremidiFlutterBindings {
 
   late final _lrm_get_versionPtr =
       _lookup<ffi.NativeFunction<ffi.Pointer<ffi.Char> Function()>>(
-    'lrm_get_version',
-  );
+          'lrm_get_version');
   late final _lrm_get_version =
       _lrm_get_versionPtr.asFunction<ffi.Pointer<ffi.Char> Function()>();
+
+  /// Free a heap buffer that the library handed to the caller (e.g. the MIDI
+  /// message data delivered to LrmMidiCallback). Safe to call with NULL.
+  void lrm_free(
+    ffi.Pointer<ffi.Void> ptr,
+  ) {
+    return _lrm_free(
+      ptr,
+    );
+  }
+
+  late final _lrm_freePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+          'lrm_free');
+  late final _lrm_free =
+      _lrm_freePtr.asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
   /// Create a new observer for enumerating MIDI ports
   ffi.Pointer<LrmObserver> lrm_observer_new() {
@@ -51,8 +67,7 @@ class LibremidiFlutterBindings {
 
   late final _lrm_observer_newPtr =
       _lookup<ffi.NativeFunction<ffi.Pointer<LrmObserver> Function()>>(
-    'lrm_observer_new',
-  );
+          'lrm_observer_new');
   late final _lrm_observer_new =
       _lrm_observer_newPtr.asFunction<ffi.Pointer<LrmObserver> Function()>();
 
@@ -61,79 +76,78 @@ class LibremidiFlutterBindings {
     LrmHotplugCallback callback,
     ffi.Pointer<ffi.Void> context,
   ) {
-    return _lrm_observer_new_with_callbacks(callback, context);
+    return _lrm_observer_new_with_callbacks(
+      callback,
+      context,
+    );
   }
 
   late final _lrm_observer_new_with_callbacksPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Pointer<LrmObserver> Function(
-            LrmHotplugCallback,
-            ffi.Pointer<ffi.Void>,
-          )>>('lrm_observer_new_with_callbacks');
+          ffi.Pointer<LrmObserver> Function(LrmHotplugCallback,
+              ffi.Pointer<ffi.Void>)>>('lrm_observer_new_with_callbacks');
   late final _lrm_observer_new_with_callbacks =
       _lrm_observer_new_with_callbacksPtr.asFunction<
           ffi.Pointer<LrmObserver> Function(
-            LrmHotplugCallback,
-            ffi.Pointer<ffi.Void>,
-          )>();
+              LrmHotplugCallback, ffi.Pointer<ffi.Void>)>();
 
   /// Free the observer
-  void lrm_observer_free(ffi.Pointer<LrmObserver> observer) {
-    return _lrm_observer_free(observer);
+  void lrm_observer_free(
+    ffi.Pointer<LrmObserver> observer,
+  ) {
+    return _lrm_observer_free(
+      observer,
+    );
   }
 
   late final _lrm_observer_freePtr =
       _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmObserver>)>>(
-    'lrm_observer_free',
-  );
+          'lrm_observer_free');
   late final _lrm_observer_free = _lrm_observer_freePtr
       .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
 
-  /// Free a heap buffer that the library handed to the caller
-  void lrm_free(ffi.Pointer<ffi.Void> ptr) {
-    return _lrm_free(ptr);
-  }
-
-  late final _lrm_freePtr =
-      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
-    'lrm_free',
-  );
-  late final _lrm_free =
-      _lrm_freePtr.asFunction<void Function(ffi.Pointer<ffi.Void>)>();
-
   /// Refresh port list
-  void lrm_observer_refresh(ffi.Pointer<LrmObserver> observer) {
-    return _lrm_observer_refresh(observer);
+  void lrm_observer_refresh(
+    ffi.Pointer<LrmObserver> observer,
+  ) {
+    return _lrm_observer_refresh(
+      observer,
+    );
   }
 
   late final _lrm_observer_refreshPtr =
       _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmObserver>)>>(
-    'lrm_observer_refresh',
-  );
+          'lrm_observer_refresh');
   late final _lrm_observer_refresh = _lrm_observer_refreshPtr
       .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
 
   /// Get count of available input ports
-  int lrm_observer_get_input_count(ffi.Pointer<LrmObserver> observer) {
-    return _lrm_observer_get_input_count(observer);
+  int lrm_observer_get_input_count(
+    ffi.Pointer<LrmObserver> observer,
+  ) {
+    return _lrm_observer_get_input_count(
+      observer,
+    );
   }
 
   late final _lrm_observer_get_input_countPtr =
       _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<LrmObserver>)>>(
-    'lrm_observer_get_input_count',
-  );
+          'lrm_observer_get_input_count');
   late final _lrm_observer_get_input_count = _lrm_observer_get_input_countPtr
       .asFunction<int Function(ffi.Pointer<LrmObserver>)>();
 
   /// Get count of available output ports
-  int lrm_observer_get_output_count(ffi.Pointer<LrmObserver> observer) {
-    return _lrm_observer_get_output_count(observer);
+  int lrm_observer_get_output_count(
+    ffi.Pointer<LrmObserver> observer,
+  ) {
+    return _lrm_observer_get_output_count(
+      observer,
+    );
   }
 
   late final _lrm_observer_get_output_countPtr =
       _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<LrmObserver>)>>(
-    'lrm_observer_get_output_count',
-  );
+          'lrm_observer_get_output_count');
   late final _lrm_observer_get_output_count = _lrm_observer_get_output_countPtr
       .asFunction<int Function(ffi.Pointer<LrmObserver>)>();
 
@@ -143,16 +157,17 @@ class LibremidiFlutterBindings {
     int index,
     ffi.Pointer<LrmPortInfo> info,
   ) {
-    return _lrm_observer_get_input(observer, index, info);
+    return _lrm_observer_get_input(
+      observer,
+      index,
+      info,
+    );
   }
 
   late final _lrm_observer_get_inputPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(
-            ffi.Pointer<LrmObserver>,
-            ffi.Int32,
-            ffi.Pointer<LrmPortInfo>,
-          )>>('lrm_observer_get_input');
+          ffi.Int32 Function(ffi.Pointer<LrmObserver>, ffi.Int32,
+              ffi.Pointer<LrmPortInfo>)>>('lrm_observer_get_input');
   late final _lrm_observer_get_input = _lrm_observer_get_inputPtr.asFunction<
       int Function(ffi.Pointer<LrmObserver>, int, ffi.Pointer<LrmPortInfo>)>();
 
@@ -162,36 +177,39 @@ class LibremidiFlutterBindings {
     int index,
     ffi.Pointer<LrmPortInfo> info,
   ) {
-    return _lrm_observer_get_output(observer, index, info);
+    return _lrm_observer_get_output(
+      observer,
+      index,
+      info,
+    );
   }
 
   late final _lrm_observer_get_outputPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(
-            ffi.Pointer<LrmObserver>,
-            ffi.Int32,
-            ffi.Pointer<LrmPortInfo>,
-          )>>('lrm_observer_get_output');
+          ffi.Int32 Function(ffi.Pointer<LrmObserver>, ffi.Int32,
+              ffi.Pointer<LrmPortInfo>)>>('lrm_observer_get_output');
   late final _lrm_observer_get_output = _lrm_observer_get_outputPtr.asFunction<
       int Function(ffi.Pointer<LrmObserver>, int, ffi.Pointer<LrmPortInfo>)>();
 
   /// Find the closest matching port using heuristic fuzzy matching.
+  /// Takes a saved LrmPortInfo and searches current ports for the best match.
   /// Returns the port index (>= 0) on success, or -1 if no match found.
   int lrm_find_closest_port(
     ffi.Pointer<LrmObserver> observer,
     ffi.Pointer<LrmPortInfo> saved,
     bool is_input,
   ) {
-    return _lrm_find_closest_port(observer, saved, is_input);
+    return _lrm_find_closest_port(
+      observer,
+      saved,
+      is_input,
+    );
   }
 
   late final _lrm_find_closest_portPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(
-            ffi.Pointer<LrmObserver>,
-            ffi.Pointer<LrmPortInfo>,
-            ffi.Bool,
-          )>>('lrm_find_closest_port');
+          ffi.Int32 Function(ffi.Pointer<LrmObserver>, ffi.Pointer<LrmPortInfo>,
+              ffi.Bool)>>('lrm_find_closest_port');
   late final _lrm_find_closest_port = _lrm_find_closest_portPtr.asFunction<
       int Function(ffi.Pointer<LrmObserver>, ffi.Pointer<LrmPortInfo>, bool)>();
 
@@ -200,7 +218,10 @@ class LibremidiFlutterBindings {
     ffi.Pointer<LrmObserver> observer,
     int port_index,
   ) {
-    return _lrm_midi_out_open(observer, port_index);
+    return _lrm_midi_out_open(
+      observer,
+      port_index,
+    );
   }
 
   late final _lrm_midi_out_openPtr = _lookup<
@@ -215,7 +236,10 @@ class LibremidiFlutterBindings {
     ffi.Pointer<LrmObserver> observer,
     int port_id,
   ) {
-    return _lrm_midi_out_open_by_id(observer, port_id);
+    return _lrm_midi_out_open_by_id(
+      observer,
+      port_id,
+    );
   }
 
   late final _lrm_midi_out_open_by_idPtr = _lookup<
@@ -226,26 +250,32 @@ class LibremidiFlutterBindings {
       ffi.Pointer<LrmMidiOut> Function(ffi.Pointer<LrmObserver>, int)>();
 
   /// Close and free a MIDI output
-  void lrm_midi_out_close(ffi.Pointer<LrmMidiOut> midi_out) {
-    return _lrm_midi_out_close(midi_out);
+  void lrm_midi_out_close(
+    ffi.Pointer<LrmMidiOut> midi_out,
+  ) {
+    return _lrm_midi_out_close(
+      midi_out,
+    );
   }
 
   late final _lrm_midi_out_closePtr =
       _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmMidiOut>)>>(
-    'lrm_midi_out_close',
-  );
+          'lrm_midi_out_close');
   late final _lrm_midi_out_close = _lrm_midi_out_closePtr
       .asFunction<void Function(ffi.Pointer<LrmMidiOut>)>();
 
   /// Check if output is connected
-  bool lrm_midi_out_is_connected(ffi.Pointer<LrmMidiOut> midi_out) {
-    return _lrm_midi_out_is_connected(midi_out);
+  bool lrm_midi_out_is_connected(
+    ffi.Pointer<LrmMidiOut> midi_out,
+  ) {
+    return _lrm_midi_out_is_connected(
+      midi_out,
+    );
   }
 
   late final _lrm_midi_out_is_connectedPtr =
       _lookup<ffi.NativeFunction<ffi.Bool Function(ffi.Pointer<LrmMidiOut>)>>(
-    'lrm_midi_out_is_connected',
-  );
+          'lrm_midi_out_is_connected');
   late final _lrm_midi_out_is_connected = _lrm_midi_out_is_connectedPtr
       .asFunction<bool Function(ffi.Pointer<LrmMidiOut>)>();
 
@@ -255,16 +285,17 @@ class LibremidiFlutterBindings {
     ffi.Pointer<ffi.Uint8> data,
     int length,
   ) {
-    return _lrm_midi_out_send(midi_out, data, length);
+    return _lrm_midi_out_send(
+      midi_out,
+      data,
+      length,
+    );
   }
 
   late final _lrm_midi_out_sendPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(
-            ffi.Pointer<LrmMidiOut>,
-            ffi.Pointer<ffi.Uint8>,
-            ffi.Size,
-          )>>('lrm_midi_out_send');
+          ffi.Int32 Function(ffi.Pointer<LrmMidiOut>, ffi.Pointer<ffi.Uint8>,
+              ffi.Size)>>('lrm_midi_out_send');
   late final _lrm_midi_out_send = _lrm_midi_out_sendPtr.asFunction<
       int Function(ffi.Pointer<LrmMidiOut>, ffi.Pointer<ffi.Uint8>, int)>();
 
@@ -296,24 +327,16 @@ class LibremidiFlutterBindings {
   late final _lrm_midi_in_openPtr = _lookup<
       ffi.NativeFunction<
           ffi.Pointer<LrmMidiIn> Function(
-            ffi.Pointer<LrmObserver>,
-            ffi.Int32,
-            LrmMidiCallback,
-            ffi.Pointer<ffi.Void>,
-            ffi.Bool,
-            ffi.Bool,
-            ffi.Bool,
-          )>>('lrm_midi_in_open');
+              ffi.Pointer<LrmObserver>,
+              ffi.Int32,
+              LrmMidiCallback,
+              ffi.Pointer<ffi.Void>,
+              ffi.Bool,
+              ffi.Bool,
+              ffi.Bool)>>('lrm_midi_in_open');
   late final _lrm_midi_in_open = _lrm_midi_in_openPtr.asFunction<
-      ffi.Pointer<LrmMidiIn> Function(
-        ffi.Pointer<LrmObserver>,
-        int,
-        LrmMidiCallback,
-        ffi.Pointer<ffi.Void>,
-        bool,
-        bool,
-        bool,
-      )>();
+      ffi.Pointer<LrmMidiIn> Function(ffi.Pointer<LrmObserver>, int,
+          LrmMidiCallback, ffi.Pointer<ffi.Void>, bool, bool, bool)>();
 
   /// Open a MIDI input port by port_id (stable across hotplug)
   ffi.Pointer<LrmMidiIn> lrm_midi_in_open_by_id(
@@ -339,46 +362,44 @@ class LibremidiFlutterBindings {
   late final _lrm_midi_in_open_by_idPtr = _lookup<
       ffi.NativeFunction<
           ffi.Pointer<LrmMidiIn> Function(
-            ffi.Pointer<LrmObserver>,
-            ffi.Uint64,
-            LrmMidiCallback,
-            ffi.Pointer<ffi.Void>,
-            ffi.Bool,
-            ffi.Bool,
-            ffi.Bool,
-          )>>('lrm_midi_in_open_by_id');
+              ffi.Pointer<LrmObserver>,
+              ffi.Uint64,
+              LrmMidiCallback,
+              ffi.Pointer<ffi.Void>,
+              ffi.Bool,
+              ffi.Bool,
+              ffi.Bool)>>('lrm_midi_in_open_by_id');
   late final _lrm_midi_in_open_by_id = _lrm_midi_in_open_by_idPtr.asFunction<
-      ffi.Pointer<LrmMidiIn> Function(
-        ffi.Pointer<LrmObserver>,
-        int,
-        LrmMidiCallback,
-        ffi.Pointer<ffi.Void>,
-        bool,
-        bool,
-        bool,
-      )>();
+      ffi.Pointer<LrmMidiIn> Function(ffi.Pointer<LrmObserver>, int,
+          LrmMidiCallback, ffi.Pointer<ffi.Void>, bool, bool, bool)>();
 
   /// Close and free a MIDI input
-  void lrm_midi_in_close(ffi.Pointer<LrmMidiIn> midi_in) {
-    return _lrm_midi_in_close(midi_in);
+  void lrm_midi_in_close(
+    ffi.Pointer<LrmMidiIn> midi_in,
+  ) {
+    return _lrm_midi_in_close(
+      midi_in,
+    );
   }
 
   late final _lrm_midi_in_closePtr =
       _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmMidiIn>)>>(
-    'lrm_midi_in_close',
-  );
+          'lrm_midi_in_close');
   late final _lrm_midi_in_close =
       _lrm_midi_in_closePtr.asFunction<void Function(ffi.Pointer<LrmMidiIn>)>();
 
   /// Check if input is connected
-  bool lrm_midi_in_is_connected(ffi.Pointer<LrmMidiIn> midi_in) {
-    return _lrm_midi_in_is_connected(midi_in);
+  bool lrm_midi_in_is_connected(
+    ffi.Pointer<LrmMidiIn> midi_in,
+  ) {
+    return _lrm_midi_in_is_connected(
+      midi_in,
+    );
   }
 
   late final _lrm_midi_in_is_connectedPtr =
       _lookup<ffi.NativeFunction<ffi.Bool Function(ffi.Pointer<LrmMidiIn>)>>(
-    'lrm_midi_in_is_connected',
-  );
+          'lrm_midi_in_is_connected');
   late final _lrm_midi_in_is_connected = _lrm_midi_in_is_connectedPtr
       .asFunction<bool Function(ffi.Pointer<LrmMidiIn>)>();
 }
@@ -444,17 +465,15 @@ final class LrmPortInfo extends ffi.Struct {
 }
 
 typedef LrmMidiCallbackFunction = ffi.Void Function(
-  ffi.Pointer<ffi.Void> context,
-  ffi.Pointer<ffi.Uint8> data,
-  ffi.Size length,
-  ffi.Int64 timestamp,
-);
+    ffi.Pointer<ffi.Void> context,
+    ffi.Pointer<ffi.Uint8> data,
+    ffi.Size length,
+    ffi.Int64 timestamp);
 typedef DartLrmMidiCallbackFunction = void Function(
-  ffi.Pointer<ffi.Void> context,
-  ffi.Pointer<ffi.Uint8> data,
-  int length,
-  int timestamp,
-);
+    ffi.Pointer<ffi.Void> context,
+    ffi.Pointer<ffi.Uint8> data,
+    int length,
+    int timestamp);
 
 /// Called when MIDI message is received
 typedef LrmMidiCallback
