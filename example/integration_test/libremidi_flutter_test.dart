@@ -291,4 +291,101 @@ void main() {
       expect(stream, isA<Stream<HotplugEventType>>());
     });
   });
+
+  // =========================================================================
+  // Fuzzy port matching (native lrm_find_closest_port)
+  // =========================================================================
+
+  group('Fuzzy port matching', () {
+    tearDown(() {
+      LibremidiFlutter.dispose();
+    });
+
+    testWidgets('findClosest returns -1 for an unknown port without throwing', (
+      tester,
+    ) async {
+      // Exercises the native lrm_find_closest_port symbol end to end (this is
+      // exactly the kind of call that would fail if the export were missing on
+      // a platform). A port that matches nothing must return -1, not crash.
+      final phantom = MidiPort.fromMatchJson({
+        'port_name': '__no_such_port__',
+        'display_name': '__no_such_port__',
+      })!;
+      expect(LibremidiFlutter.findClosestInputPort(phantom), -1);
+      expect(LibremidiFlutter.findClosestOutputPort(phantom), -1);
+    });
+
+    testWidgets('a real port round-trips through toMatchJson and is re-found', (
+      tester,
+    ) async {
+      // Persisting a real port via toMatchJson and restoring it via
+      // fromMatchJson must resolve back to a valid index. Skips when the host
+      // has no MIDI ports (e.g. headless CI).
+      final outputs = LibremidiFlutter.getOutputPorts();
+      if (outputs.isEmpty) return;
+      final restored = MidiPort.fromMatchJson(outputs.first.toMatchJson())!;
+      final index = LibremidiFlutter.findClosestOutputPort(restored);
+      expect(index, greaterThanOrEqualTo(0));
+      expect(index, lessThan(outputs.length));
+    });
+
+    testWidgets('observer.findClosestPort resolves a restored input port', (
+      tester,
+    ) async {
+      final observer = MidiObserver();
+      try {
+        final inputs = observer.getInputPorts();
+        if (inputs.isEmpty) return;
+        final restored = MidiPort.fromMatchJson(inputs.first.toMatchJson())!;
+        final index = observer.findClosestPort(restored, isInput: true);
+        expect(index, greaterThanOrEqualTo(0));
+        expect(index, lessThan(inputs.length));
+      } finally {
+        observer.dispose();
+      }
+    });
+  });
+
+  // =========================================================================
+  // Input connection lifecycle (NativeCallable / message callback path)
+  // =========================================================================
+  //
+  // Note: the actual SysEx-large-buffer / lrm_free path only fires when a MIDI
+  // source sends data, which needs a connected (or virtual) device — not
+  // available headlessly. These smoke tests exercise the open -> subscribe ->
+  // dispose lifecycle of the callback machinery, which is where the
+  // use-after-free fix lives.
+
+  group('Input connection', () {
+    testWidgets('open, subscribe and dispose an input does not crash', (
+      tester,
+    ) async {
+      final observer = MidiObserver();
+      try {
+        final inputs = observer.getInputPorts();
+        if (inputs.isEmpty) return;
+        final input = observer.openInput(inputs.first);
+        final sub = input.messages.listen((_) {});
+        await tester.pump(const Duration(milliseconds: 50));
+        await sub.cancel();
+        input.dispose();
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    testWidgets('open and dispose without listening does not crash', (
+      tester,
+    ) async {
+      final observer = MidiObserver();
+      try {
+        final inputs = observer.getInputPorts();
+        if (inputs.isEmpty) return;
+        final input = observer.openInput(inputs.first);
+        input.dispose();
+      } finally {
+        observer.dispose();
+      }
+    });
+  });
 }
