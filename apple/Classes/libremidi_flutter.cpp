@@ -11,7 +11,6 @@
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
 
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -58,25 +57,19 @@ struct LrmObserver {
         , midiClient(0)
         , refreshQueue(dispatch_queue_create("dev.celtera.libremidi.refresh", DISPATCH_QUEUE_SERIAL))
     {
-        printf("[libremidi] Creating observer, callback=%p\n", (void*)callback);
-
         if (hotplug_callback) {
             // Create our own MIDI client using MIDIClientCreateWithBlock
             // This delivers notifications via dispatch queue (works with Flutter)
             // instead of CFRunLoop (which doesn't work with Flutter)
-            OSStatus status = MIDIClientCreateWithBlock(
+            // On failure midiClient is left 0, which the destructor and the
+            // hotplug paths already handle, so there is nothing to recover.
+            MIDIClientCreateWithBlock(
                 CFSTR("libremidi_flutter"),
                 &midiClient,
                 ^(const MIDINotification* notification) {
                     handleMIDINotification(this, notification);
                 }
             );
-
-            if (status != noErr) {
-                printf("[libremidi] MIDIClientCreateWithBlock failed: %d\n", (int)status);
-            } else {
-                printf("[libremidi] MIDIClientCreateWithBlock succeeded, client=%u\n", (unsigned)midiClient);
-            }
         }
 
         // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves on macOS)
@@ -87,9 +80,7 @@ struct LrmObserver {
 
         // Don't set callbacks - we use our own MIDIClient for notifications on macOS
         observer = std::make_unique<libremidi::observer>(std::move(config));
-        printf("[libremidi] Observer created successfully\n");
         refreshInternal();
-        printf("[libremidi] Found %zu inputs, %zu outputs\n", input_ports.size(), output_ports.size());
     }
 
     ~LrmObserver() {
