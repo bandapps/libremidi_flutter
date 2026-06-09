@@ -418,6 +418,9 @@ static int32_t find_closest_port_impl(
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
     LrmObserver* observer, const LrmPortInfo* saved, bool is_input) {
     if (!observer || !saved) return -1;
+    // Hold ports_mutex for the whole match: hotplug refresh replaces these
+    // vectors under the same lock, so reading them unlocked would race with it.
+    std::lock_guard<std::mutex> lock(observer->ports_mutex);
     if (is_input) {
         return find_closest_port_impl(observer->input_ports, saved);
     } else {
