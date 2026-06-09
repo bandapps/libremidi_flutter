@@ -5,15 +5,12 @@
 
 #if defined(__APPLE__)
   #define LIBREMIDI_COREMIDI 1
-#elif defined(_WIN32)
-  #define LIBREMIDI_WINMM 1
-#elif defined(__linux__)
-  #define LIBREMIDI_ALSA 1
 #endif
 
 #include <libremidi/libremidi.hpp>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -243,9 +240,22 @@ struct LrmMidiIn {
         config.ignore_timing = !receive_timing;
         config.ignore_sensing = !receive_sensing;
         config.on_message = [this](const libremidi::message& msg) {
-            if (callback) {
-                callback(context, msg.bytes.data(), msg.bytes.size(), msg.timestamp);
-            }
+            if (!callback)
+                return;
+            const size_t size = msg.bytes.size();
+            if (size == 0)
+                return;
+            // libremidi reuses a single message buffer: it is cleared as soon as
+            // this synchronous callback returns and overwritten for every further
+            // message in the same packet. The Dart side is a
+            // NativeCallable.listener that reads the bytes later on the event
+            // loop, so hand it an owning heap copy and let it release the copy
+            // via lrm_free once it has been read.
+            auto* copy = static_cast<uint8_t*>(std::malloc(size));
+            if (!copy)
+                return;
+            std::memcpy(copy, msg.bytes.data(), size);
+            callback(context, copy, size, msg.timestamp);
         };
 
         midi_in = std::make_unique<libremidi::midi_in>(std::move(config));
@@ -281,6 +291,12 @@ struct LrmMidiOut {
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
     return "0.8.4";
+}
+
+// Free a heap buffer handed to Dart by the input callback. Uses the library's
+// own allocator so the caller does not depend on a matching C runtime.
+extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
+    std::free(ptr);
 }
 
 // =============================================================================

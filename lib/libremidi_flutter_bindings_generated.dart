@@ -89,6 +89,18 @@ class LibremidiFlutterBindings {
   late final _lrm_observer_free = _lrm_observer_freePtr
       .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
 
+  /// Free a heap buffer that the library handed to the caller
+  void lrm_free(ffi.Pointer<ffi.Void> ptr) {
+    return _lrm_free(ptr);
+  }
+
+  late final _lrm_freePtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void>)>>(
+    'lrm_free',
+  );
+  late final _lrm_free =
+      _lrm_freePtr.asFunction<void Function(ffi.Pointer<ffi.Void>)>();
+
   /// Refresh port list
   void lrm_observer_refresh(ffi.Pointer<LrmObserver> observer) {
     return _lrm_observer_refresh(observer);

@@ -96,6 +96,10 @@ typedef void (*LrmHotplugCallback)(
 // Get library version string
 FFI_PLUGIN_EXPORT const char* lrm_get_version(void);
 
+// Free a heap buffer that the library handed to the caller (e.g. the MIDI
+// message data delivered to LrmMidiCallback). Safe to call with NULL.
+FFI_PLUGIN_EXPORT void lrm_free(void* ptr);
+
 // =============================================================================
 // Observer API - Enumerate MIDI ports
 // =============================================================================

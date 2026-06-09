@@ -1211,13 +1211,18 @@ class MidiInput {
     int length,
     int timestamp,
   ) {
-    if (_disposed) return;
-
+    // [data] is an owning heap copy allocated by the native callback (the
+    // libremidi message buffer itself is reused and would be overwritten before
+    // this listener runs on the event loop). Copy it out, then release it via
+    // lrm_free — also when disposed, so buffers for messages still queued at
+    // dispose time are not leaked.
     final bytes = Uint8List(length);
-    for (var i = 0; i < length; i++) {
-      bytes[i] = data[i];
+    if (length > 0) {
+      bytes.setAll(0, data.asTypedList(length));
     }
+    _bindings.lrm_free(data.cast<Void>());
 
+    if (_disposed) return;
     _messageController.add(MidiMessage(bytes, timestamp: timestamp));
   }
 
