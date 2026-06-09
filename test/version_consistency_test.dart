@@ -52,6 +52,12 @@ void main() {
         .firstMatch(readFromRoot('macos/libremidi_flutter.podspec'))
         ?.group(1);
 
+    // README install snippet: libremidi_flutter: ^x.y.z
+    final readmeVersion = RegExp(
+            r'libremidi_flutter:\s*\^([0-9]+\.[0-9]+\.[0-9]+)')
+        .firstMatch(readFromRoot('README.md'))
+        ?.group(1);
+
     expect(pubspecVersion, isNotNull,
         reason: 'could not parse version from pubspec.yaml');
     expect(srcVersion, isNotNull,
@@ -74,5 +80,9 @@ void main() {
     expect(macosPodspecVersion, pubspecVersion,
         reason: 'version drift: macos/libremidi_flutter.podspec '
             '($macosPodspecVersion) != pubspec ($pubspecVersion).');
+    expect(readmeVersion, pubspecVersion,
+        reason: 'version drift: README install snippet '
+            '(^$readmeVersion) != pubspec ($pubspecVersion) — '
+            'update the `dependencies:` example when bumping the version.');
   });
 }
