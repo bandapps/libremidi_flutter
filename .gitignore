@@ -39,10 +39,3 @@ migrate_working_dir/
 **/.gradle/
 **/.cxx/
 /coverage/
-
-# Vendored libremidi content not needed to build this Flutter plugin.
-third_party/libremidi/tests/
-third_party/libremidi/examples/
-third_party/libremidi/book/
-third_party/libremidi/bindings/
-third_party/libremidi/.github/

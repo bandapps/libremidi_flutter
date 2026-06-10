@@ -17,3 +17,6 @@ third_party/libremidi/.gitignore
 build/
 .dart_tool/
 .packages
+
+# Internal project notes (not for the published package)
+CLAUDE.md
