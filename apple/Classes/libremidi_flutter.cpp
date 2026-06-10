@@ -58,9 +58,35 @@ struct LrmObserver {
         , refreshQueue(dispatch_queue_create("dev.celtera.libremidi.refresh", DISPATCH_QUEUE_SERIAL))
     {
         if (hotplug_callback) {
-            // Create our own MIDI client using MIDIClientCreateWithBlock
+            // Hotplug (long-lived UI) path. On a real iOS device the first
+            // CoreMIDI/midiserverd contact can block for minutes. Dart calls
+            // this constructor synchronously over FFI on the UI isolate, so
+            // doing the work here froze the whole UI (white screen until the
+            // call returned). Defer the blocking CoreMIDI setup to the
+            // background serial queue and emit SETUP_CHANGED when done, so Dart
+            // re-reads the now-populated port cache. The caller returns
+            // immediately and the UI stays responsive.
+            dispatch_async(refreshQueue, ^{
+                initInternal();
+                notifyHotplug(LRM_EVENT_SETUP_CHANGED);
+            });
+        } else {
+            // No-hotplug (one-shot query) path: kept synchronous so a
+            // construct-then-read stays valid. The integration tests and any
+            // poll-based caller rely on ports being available right away.
+            initInternal();
+        }
+    }
+
+    // Performs the actual (potentially slow) CoreMIDI initialisation: creates
+    // our notification client, the libremidi observer and fills the port cache.
+    // Called synchronously for the no-hotplug path and on the refresh queue for
+    // the hotplug path.
+    void initInternal() {
+        if (hotplug_callback) {
+            // Create our own MIDI client using MIDIClientCreateWithBlock.
             // This delivers notifications via dispatch queue (works with Flutter)
-            // instead of CFRunLoop (which doesn't work with Flutter)
+            // instead of CFRunLoop (which doesn't work with Flutter).
             // On failure midiClient is left 0, which the destructor and the
             // hotplug paths already handle, so there is nothing to recover.
             MIDIClientCreateWithBlock(
@@ -72,27 +98,32 @@ struct LrmObserver {
             );
         }
 
-        // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves on macOS)
+        // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves).
         libremidi::observer_configuration config;
         config.track_hardware = true;
         config.track_virtual = true;
         config.notify_in_constructor = false;
 
-        // Don't set callbacks - we use our own MIDIClient for notifications on macOS
-        observer = std::make_unique<libremidi::observer>(std::move(config));
+        auto obs = std::make_unique<libremidi::observer>(std::move(config));
+        {
+            std::lock_guard<std::mutex> lock(ports_mutex);
+            observer = std::move(obs);
+        }
         refreshInternal();
     }
 
     ~LrmObserver() {
         // Prevent late callbacks during/after dispose
         hotplug_callback = nullptr;
+        // Drain pending blocks before freeing — prevents use-after-free if a
+        // hotplug notification was dispatched, or the async init is still
+        // running, just before dispose. Both capture `this`, so we must wait
+        // for them before tearing down the MIDI client below.
+        dispatch_sync(refreshQueue, ^{});
         if (midiClient) {
             MIDIClientDispose(midiClient);
             midiClient = 0;
         }
-        // Drain pending blocks before freeing — prevents use-after-free
-        // if a hotplug notification was dispatched just before dispose.
-        dispatch_sync(refreshQueue, ^{});
     }
 
     /// Refresh + notify on a background queue to avoid blocking the main
@@ -105,15 +136,21 @@ struct LrmObserver {
     }
 
     void refreshInternal() {
-        if (observer) {
-            // Enumerate without holding the lock to avoid deadlock with
-            // CoreMIDI's internal locks during notification handling.
-            auto new_inputs = observer->get_input_ports();
-            auto new_outputs = observer->get_output_ports();
+        // The observer pointer is assigned on the refresh queue for the async
+        // (hotplug) init path, so snapshot it under the lock before using it.
+        libremidi::observer* obs;
+        {
             std::lock_guard<std::mutex> lock(ports_mutex);
-            input_ports = std::move(new_inputs);
-            output_ports = std::move(new_outputs);
+            obs = observer.get();
         }
+        if (!obs) return;
+        // Enumerate without holding the lock to avoid deadlock with
+        // CoreMIDI's internal locks during notification handling.
+        auto new_inputs = obs->get_input_ports();
+        auto new_outputs = obs->get_output_ports();
+        std::lock_guard<std::mutex> lock(ports_mutex);
+        input_ports = std::move(new_inputs);
+        output_ports = std::move(new_outputs);
     }
 
     void refresh() {
