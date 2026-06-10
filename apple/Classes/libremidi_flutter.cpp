@@ -1,7 +1,9 @@
 // Shared Apple (iOS + macOS) CoreMIDI implementation.
 // Both platforms compile this single file via their SwiftPM targets
-// (ios/ and macos/ Sources symlink here). Uses MIDIClientCreateWithBlock for
-// hotplug notifications (GCD-based, works with Flutter's run loop).
+// (ios/ and macos/ Sources symlink here). Hotplug notifications use
+// MIDIClientCreate on a dedicated thread with its own persistent CFRunLoop,
+// keeping the slow first CoreMIDI contact off Flutter's UI thread while
+// keeping notification delivery reliable.
 #include "libremidi_flutter.h"
 
 // Enable header-only mode and CoreMIDI backend
@@ -13,9 +15,11 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -36,9 +40,8 @@
 // Forward declaration
 struct LrmObserver;
 
-// We use MIDIClientCreateWithBlock because it delivers notifications via dispatch queue
-// instead of CFRunLoop. This is the same approach used by FlutterMidiCommand and works
-// properly with Flutter's event loop.
+// Hotplug notifications use the classic run-loop based MIDIClientCreate, served
+// by a dedicated thread that owns a persistent CFRunLoop (see LrmObserver).
 static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification);
 
 struct LrmObserver {
@@ -50,51 +53,101 @@ struct LrmObserver {
     mutable std::mutex ports_mutex;
 
     MIDIClientRef midiClient;
-    dispatch_queue_t refreshQueue;
+
+    // Dedicated CoreMIDI thread with its own CFRunLoop (hotplug path only).
+    // CoreMIDI notifications are delivered to the run loop of the thread that
+    // created the client, so that thread must stay alive and run its loop for
+    // the observer's lifetime. A transient GCD-queue worker thread does NOT
+    // satisfy this — using one silently killed hotplug delivery, so a device
+    // plugged in after launch never appeared.
+    std::thread midiThread;
+    CFRunLoopRef midiRunLoop;
+    std::mutex runloop_mutex;
+    std::condition_variable runloop_cv;
+    bool runloop_ready;
 
     LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
         : hotplug_callback(callback), hotplug_context(context)
         , midiClient(0)
-        , refreshQueue(dispatch_queue_create("dev.celtera.libremidi.refresh", DISPATCH_QUEUE_SERIAL))
+        , midiRunLoop(nullptr)
+        , runloop_ready(false)
     {
         if (hotplug_callback) {
             // Hotplug (long-lived UI) path. On a real iOS device the first
-            // CoreMIDI/midiserverd contact can block for minutes. Dart calls
-            // this constructor synchronously over FFI on the UI isolate, so
-            // doing the work here froze the whole UI (white screen until the
-            // call returned). Defer the blocking CoreMIDI setup to the
-            // background serial queue and emit SETUP_CHANGED when done, so Dart
-            // re-reads the now-populated port cache. The caller returns
-            // immediately and the UI stays responsive.
-            dispatch_async(refreshQueue, ^{
-                initInternal();
-                notifyHotplug(LRM_EVENT_SETUP_CHANGED);
-            });
+            // CoreMIDI/midiserverd contact can block for minutes, and Dart
+            // calls this constructor synchronously over FFI on the UI isolate
+            // — doing the work here froze the whole UI (white screen until it
+            // returned). Run all CoreMIDI work on a dedicated thread that owns
+            // a persistent CFRunLoop: the slow first contact no longer blocks
+            // the UI, and (unlike a GCD queue) the run loop stays alive so
+            // hotplug notifications keep being delivered. SETUP_CHANGED is
+            // emitted once the initial port list is ready.
+            midiThread = std::thread([this] { midiThreadMain(); });
         } else {
             // No-hotplug (one-shot query) path: kept synchronous so a
             // construct-then-read stays valid. The integration tests and any
-            // poll-based caller rely on ports being available right away.
+            // poll-based caller rely on ports being available right away. This
+            // path creates no MIDI client and starts no thread.
             initInternal();
         }
     }
 
+    // Body of the dedicated CoreMIDI thread: stand up a persistent run loop,
+    // perform the (possibly slow) initialisation on it, then service hotplug
+    // notifications until the destructor stops the loop.
+    void midiThreadMain() {
+        midiRunLoop = CFRunLoopGetCurrent();
+
+        // Keep the run loop from returning immediately when it has no other
+        // input source yet. This source does nothing; it just holds the loop.
+        CFRunLoopSourceContext srcCtx = {};
+        srcCtx.perform = [](void*) {};
+        CFRunLoopSourceRef keepAlive = CFRunLoopSourceCreate(nullptr, 0, &srcCtx);
+        CFRunLoopAddSource(midiRunLoop, keepAlive, kCFRunLoopCommonModes);
+
+        // Publish the run loop so the destructor can stop it safely.
+        {
+            std::lock_guard<std::mutex> lock(runloop_mutex);
+            runloop_ready = true;
+        }
+        runloop_cv.notify_all();
+
+        initInternal();
+        notifyHotplug(LRM_EVENT_SETUP_CHANGED);
+
+        // Process CoreMIDI notifications until the destructor calls CFRunLoopStop.
+        CFRunLoopRun();
+
+        // Tear down the CoreMIDI objects on the same thread that created them.
+        if (midiClient) {
+            MIDIClientDispose(midiClient);
+            midiClient = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ports_mutex);
+            observer.reset();
+        }
+        CFRunLoopRemoveSource(midiRunLoop, keepAlive, kCFRunLoopCommonModes);
+        CFRelease(keepAlive);
+    }
+
     // Performs the actual (potentially slow) CoreMIDI initialisation: creates
     // our notification client, the libremidi observer and fills the port cache.
-    // Called synchronously for the no-hotplug path and on the refresh queue for
-    // the hotplug path.
+    // Runs on the dedicated MIDI thread for the hotplug path, or synchronously
+    // on the caller for the no-hotplug path.
     void initInternal() {
         if (hotplug_callback) {
-            // Create our own MIDI client using MIDIClientCreateWithBlock.
-            // This delivers notifications via dispatch queue (works with Flutter)
-            // instead of CFRunLoop (which doesn't work with Flutter).
-            // On failure midiClient is left 0, which the destructor and the
-            // hotplug paths already handle, so there is nothing to recover.
-            MIDIClientCreateWithBlock(
+            // Classic, run-loop based MIDIClientCreate: notifications are
+            // delivered on THIS thread's CFRunLoop, which midiThreadMain keeps
+            // running for the observer's lifetime, so hotplug stays reliable.
+            // On failure midiClient is left 0, which every other path tolerates.
+            MIDIClientCreate(
                 CFSTR("libremidi_flutter"),
-                &midiClient,
-                ^(const MIDINotification* notification) {
-                    handleMIDINotification(this, notification);
-                }
+                [](const MIDINotification* notification, void* refCon) {
+                    handleMIDINotification(static_cast<LrmObserver*>(refCon), notification);
+                },
+                this,
+                &midiClient
             );
         }
 
@@ -113,31 +166,39 @@ struct LrmObserver {
     }
 
     ~LrmObserver() {
-        // Prevent late callbacks during/after dispose
+        // Reject any late hotplug callbacks first.
         hotplug_callback = nullptr;
-        // Drain pending blocks before freeing — prevents use-after-free if a
-        // hotplug notification was dispatched, or the async init is still
-        // running, just before dispose. Both capture `this`, so we must wait
-        // for them before tearing down the MIDI client below.
-        dispatch_sync(refreshQueue, ^{});
-        if (midiClient) {
+
+        if (midiThread.joinable()) {
+            // Wait until the run loop has been published, then stop it so the
+            // thread can dispose the CoreMIDI objects and exit. If the slow
+            // first CoreMIDI contact is still running in initInternal, the stop
+            // is latched and takes effect as soon as it reaches CFRunLoopRun.
+            {
+                std::unique_lock<std::mutex> lock(runloop_mutex);
+                runloop_cv.wait(lock, [this] { return runloop_ready; });
+            }
+            CFRunLoopStop(midiRunLoop);
+            midiThread.join();
+        } else if (midiClient) {
+            // No-thread path: normally no client is created here, dispose
+            // defensively just in case.
             MIDIClientDispose(midiClient);
             midiClient = 0;
         }
     }
 
-    /// Refresh + notify on a background queue to avoid blocking the main
-    /// thread (CoreMIDI delivers notifications on the main RunLoop).
-    void refreshAndNotifyAsync(int eventType) {
-        dispatch_async(refreshQueue, ^{
-            refreshInternal();
-            notifyHotplug(eventType);
-        });
+    // Refresh the port cache and notify. Called from the CoreMIDI notification
+    // handler, which already runs on the dedicated MIDI thread, so the work is
+    // done synchronously (no cross-thread dispatch needed).
+    void refreshAndNotify(int eventType) {
+        refreshInternal();
+        notifyHotplug(eventType);
     }
 
     void refreshInternal() {
-        // The observer pointer is assigned on the refresh queue for the async
-        // (hotplug) init path, so snapshot it under the lock before using it.
+        // The observer pointer is assigned on the dedicated MIDI thread for the
+        // hotplug path, so snapshot it under the lock before using it.
         libremidi::observer* obs;
         {
             std::lock_guard<std::mutex> lock(ports_mutex);
@@ -201,10 +262,8 @@ struct LrmObserver {
 };
 
 static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification) {
-    // CoreMIDI delivers notifications on the main thread RunLoop.
-    // We must not call get_input_ports()/get_output_ports() here because
-    // they re-enter the RunLoop, causing a deadlock with Flutter.
-    // Instead, dispatch refresh + notify to a background serial queue.
+    // This runs on the dedicated MIDI thread's run loop (see LrmObserver), not
+    // the UI/main thread, so it is safe to refresh and notify synchronously.
 
     switch (notification->messageID) {
         case kMIDIMsgObjectAdded: {
@@ -212,9 +271,9 @@ static void handleMIDINotification(LrmObserver* obs, const MIDINotification* not
                 (const MIDIObjectAddRemoveNotification*)notification;
 
             if (addRemove->childType == kMIDIObjectType_Source) {
-                obs->refreshAndNotifyAsync(LRM_EVENT_INPUT_ADDED);
+                obs->refreshAndNotify(LRM_EVENT_INPUT_ADDED);
             } else if (addRemove->childType == kMIDIObjectType_Destination) {
-                obs->refreshAndNotifyAsync(LRM_EVENT_OUTPUT_ADDED);
+                obs->refreshAndNotify(LRM_EVENT_OUTPUT_ADDED);
             }
             break;
         }
@@ -223,14 +282,14 @@ static void handleMIDINotification(LrmObserver* obs, const MIDINotification* not
                 (const MIDIObjectAddRemoveNotification*)notification;
 
             if (addRemove->childType == kMIDIObjectType_Source) {
-                obs->refreshAndNotifyAsync(LRM_EVENT_INPUT_REMOVED);
+                obs->refreshAndNotify(LRM_EVENT_INPUT_REMOVED);
             } else if (addRemove->childType == kMIDIObjectType_Destination) {
-                obs->refreshAndNotifyAsync(LRM_EVENT_OUTPUT_REMOVED);
+                obs->refreshAndNotify(LRM_EVENT_OUTPUT_REMOVED);
             }
             break;
         }
         case kMIDIMsgSetupChanged:
-            obs->refreshAndNotifyAsync(LRM_EVENT_SETUP_CHANGED);
+            obs->refreshAndNotify(LRM_EVENT_SETUP_CHANGED);
             break;
         default:
             break;
