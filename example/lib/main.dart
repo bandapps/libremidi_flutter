@@ -180,6 +180,10 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
       } catch (e) {
         _addOutLog('Error ${device.name}: $e');
       }
+    } else {
+      // Without this the app looked connected while every send silently did
+      // nothing, because _sendNote() returns early on a null output.
+      _addOutLog('${device.name} has no output port — nothing to send to');
     }
   }
 

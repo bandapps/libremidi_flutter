@@ -259,13 +259,20 @@ class MidiMessage {
   /// The raw MIDI data bytes.
   final Uint8List data;
 
-  /// The timestamp of the message (in microseconds).
+  /// The backend's timestamp for this message, in **nanoseconds**.
   ///
-  /// The clock source is platform-dependent:
-  /// - macOS/iOS: CoreMIDI host time (mach_absolute_time based)
-  /// - Windows: WinMM timeGetTime (milliseconds, converted to microseconds)
-  /// - Linux: ALSA sequencer timestamp
-  /// - Android: AMidi timestamp (nanoseconds, converted to microseconds)
+  /// The value is passed through from libremidi unchanged. Earlier versions of
+  /// this doc claimed microseconds and a conversion that never happened — the
+  /// value has always been what the backend reports:
+  ///
+  /// - macOS/iOS: CoreMIDI host time converted to nanoseconds
+  /// - Android: AMidi timestamp, nanoseconds
+  /// - Linux / Windows: the backend's own clock, nanoseconds where it provides
+  ///   absolute timestamps
+  ///
+  /// Only the epoch differs per platform and per session, so treat this as a
+  /// monotonic value for measuring *intervals between messages*, not as a wall
+  /// clock and not as something comparable across platforms.
   final int timestamp;
 
   const MidiMessage(this.data, {this.timestamp = 0});
@@ -642,6 +649,14 @@ class MidiObserver {
   }
 
   /// Creates a new MIDI observer with hotplug detection.
+  ///
+  /// On iOS and macOS the first CoreMIDI contact can be slow (seconds to
+  /// minutes on a physical device), so it runs on a dedicated background thread
+  /// and this constructor returns immediately. [getInputPorts] / [getOutputPorts]
+  /// therefore return empty lists until the first
+  /// [HotplugEventType.setupChanged] arrives on [onHotplug]. On Android, Linux
+  /// and Windows the port lists are already populated when the constructor
+  /// returns. See [onHotplug] for the full per-platform event contract.
   MidiObserver.withHotplug() {
     _hotplugCallable =
         NativeCallable<Void Function(Pointer<Void>, Int32)>.listener(
@@ -665,11 +680,44 @@ class MidiObserver {
     }
   }
 
+  /// Whether this observer can actually deliver hotplug events.
+  ///
+  /// False for an observer created without hotplug, and — on iOS/macOS — also
+  /// when CoreMIDI refused the notification client (for example when the MIDI
+  /// server is unreachable). That failure is otherwise invisible: the port list
+  /// is correct and the first [HotplugEventType.setupChanged] still arrives,
+  /// but no further event ever will, so an app that relies on hotplug should
+  /// check this and fall back to polling [getInputPorts] / [getOutputPorts].
+  ///
+  /// On iOS/macOS this is false until the observer has finished initialising in
+  /// the background — asking right after creating it always returns false.
+  /// Check again after the first [HotplugEventType.setupChanged] arrives; that
+  /// event is emitted once the notification client is set up, so the answer is
+  /// final from then on.
+  bool get hotplugAvailable {
+    if (_disposed || _handle == null) return false;
+    return _bindings.lrm_observer_hotplug_available(_handle!);
+  }
+
   /// Stream of hotplug events (device added/removed).
   ///
   /// Note: Events originate from native callbacks which may be invoked on
   /// a different thread. The stream delivers events asynchronously to the
   /// Dart isolate, so UI updates should be safe.
+  ///
+  /// **The event pattern differs per platform.** Treat every event as "the
+  /// port list changed, re-read it" rather than as an incremental description
+  /// of what changed — code that counts added/removed events will not behave
+  /// the same everywhere:
+  ///
+  /// - **iOS / macOS:** the port lists start out empty and a single
+  ///   [HotplugEventType.setupChanged] signals that the first enumeration
+  ///   finished. Afterwards CoreMIDI reports added/removed events, plus
+  ///   [HotplugEventType.setupChanged] for changes it does not classify.
+  /// - **Android / Linux / Windows:** the port lists are already filled when
+  ///   the observer is created, and each device present at that point is
+  ///   reported as an added event — i.e. a burst right after subscribing.
+  ///   [HotplugEventType.setupChanged] is never emitted on these platforms.
   Stream<HotplugEventType> get onHotplug => _hotplugController.stream;
 
   void _checkDisposed() {
@@ -858,6 +906,215 @@ class MidiObserver {
 }
 
 // =============================================================================
+// MidiMessageBuilder - Wire format used by MidiOutput
+// =============================================================================
+
+/// Builds the exact byte sequences that [MidiOutput] puts on the wire.
+///
+/// Every `MidiOutput.send*` method delegates here, so these builders *are* the
+/// wire contract rather than a description of it. They are pure and need no
+/// native library, which makes the byte layout (status nibbles, LSB/MSB order,
+/// Control Change ordering) testable without an open MIDI port.
+///
+/// Methods returning a `List<Uint8List>` describe a sequence that is sent as
+/// separate MIDI messages, in list order.
+///
+/// Range validation lives here too, so an out-of-range argument is rejected
+/// identically whether it came through [MidiOutput] or a direct builder call.
+class MidiMessageBuilder {
+  const MidiMessageBuilder._();
+
+  /// Note On: status 0x90 | channel, note, velocity.
+  static Uint8List noteOn({
+    required int channel,
+    required int note,
+    required int velocity,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
+    return Uint8List.fromList([0x90 | channel, note, velocity]);
+  }
+
+  /// Note Off: status 0x80 | channel, note, velocity.
+  static Uint8List noteOff({
+    required int channel,
+    required int note,
+    int velocity = 0,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
+    return Uint8List.fromList([0x80 | channel, note, velocity]);
+  }
+
+  /// Control Change: status 0xB0 | channel, controller, value.
+  static Uint8List controlChange({
+    required int channel,
+    required int controller,
+    required int value,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(controller, 0, 127, 'controller');
+    RangeError.checkValueInInterval(value, 0, 127, 'value');
+    return Uint8List.fromList([0xB0 | channel, controller, value]);
+  }
+
+  /// Program Change: status 0xC0 | channel, program. Two bytes, no data byte 2.
+  static Uint8List programChange({
+    required int channel,
+    required int program,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(program, 0, 127, 'program');
+    return Uint8List.fromList([0xC0 | channel, program]);
+  }
+
+  /// Pitch Bend: status 0xE0 | channel, then **LSB first, MSB second** — the
+  /// opposite order of the 14-bit parameter encodings used by RPN/NRPN.
+  static Uint8List pitchBend({required int channel, required int value}) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(value, 0, 16383, 'value');
+    return Uint8List.fromList([
+      0xE0 | channel,
+      value & 0x7F,
+      (value >> 7) & 0x7F,
+    ]);
+  }
+
+  /// Channel Aftertouch (Channel Pressure): status 0xD0 | channel, pressure.
+  static Uint8List aftertouch({required int channel, required int pressure}) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
+    return Uint8List.fromList([0xD0 | channel, pressure]);
+  }
+
+  /// Polyphonic Aftertouch (Key Pressure): status 0xA0 | channel, note, pressure.
+  static Uint8List polyAftertouch({
+    required int channel,
+    required int note,
+    required int pressure,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(note, 0, 127, 'note');
+    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
+    return Uint8List.fromList([0xA0 | channel, note, pressure]);
+  }
+
+  /// SysEx. Adds the 0xF0/0xF7 framing unless [alreadyFramed] is set.
+  static Uint8List sysEx(Uint8List data, {bool alreadyFramed = false}) {
+    if (alreadyFramed) return data;
+    final message = Uint8List(data.length + 2);
+    message[0] = 0xF0;
+    message.setRange(1, data.length + 1, data);
+    message[data.length + 1] = 0xF7;
+    return message;
+  }
+
+  /// Bank Select (CC 0 = MSB, CC 32 = LSB) followed by Program Change.
+  static List<Uint8List> bankSelect({
+    required int channel,
+    required int bank,
+    required int program,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(bank, 0, 16383, 'bank');
+    RangeError.checkValueInInterval(program, 0, 127, 'program');
+    return [
+      controlChange(channel: channel, controller: 0, value: (bank >> 7) & 0x7F),
+      controlChange(channel: channel, controller: 32, value: bank & 0x7F),
+      programChange(channel: channel, program: program),
+    ];
+  }
+
+  /// RPN (CC 101/100 select) or NRPN (CC 99/98 select) with a Data Entry value.
+  ///
+  /// [fourteenBit] sends CC 6 (MSB) then CC 38 (LSB); otherwise only CC 6.
+  static List<Uint8List> parameterNumber({
+    required int channel,
+    required int parameter,
+    required int value,
+    required bool registered,
+    bool fourteenBit = true,
+    bool deselect = true,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(
+      value,
+      0,
+      fourteenBit ? 16383 : 127,
+      'value',
+    );
+
+    final selectMsb = registered ? 101 : 99;
+    final selectLsb = registered ? 100 : 98;
+    final messages = <Uint8List>[
+      controlChange(
+          channel: channel,
+          controller: selectMsb,
+          value: (parameter >> 7) & 0x7F),
+      controlChange(
+          channel: channel, controller: selectLsb, value: parameter & 0x7F),
+    ];
+
+    if (fourteenBit) {
+      messages.add(controlChange(
+          channel: channel, controller: 6, value: (value >> 7) & 0x7F));
+      messages.add(
+          controlChange(channel: channel, controller: 38, value: value & 0x7F));
+    } else {
+      messages
+          .add(controlChange(channel: channel, controller: 6, value: value));
+    }
+
+    if (deselect) {
+      messages
+          .add(controlChange(channel: channel, controller: selectMsb, value: 127));
+      messages
+          .add(controlChange(channel: channel, controller: selectLsb, value: 127));
+    }
+    return messages;
+  }
+
+  /// RPN/NRPN parameter select followed by Data Increment (CC 96) or
+  /// Data Decrement (CC 97).
+  static List<Uint8List> parameterNumberRelative({
+    required int channel,
+    required int parameter,
+    required bool registered,
+    required bool increment,
+    int amount = 1,
+    bool deselect = true,
+  }) {
+    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
+    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
+    RangeError.checkValueInInterval(amount, 0, 127, 'amount');
+
+    final selectMsb = registered ? 101 : 99;
+    final selectLsb = registered ? 100 : 98;
+    final messages = <Uint8List>[
+      controlChange(
+          channel: channel,
+          controller: selectMsb,
+          value: (parameter >> 7) & 0x7F),
+      controlChange(
+          channel: channel, controller: selectLsb, value: parameter & 0x7F),
+      controlChange(
+          channel: channel, controller: increment ? 96 : 97, value: amount),
+    ];
+
+    if (deselect) {
+      messages
+          .add(controlChange(channel: channel, controller: selectMsb, value: 127));
+      messages
+          .add(controlChange(channel: channel, controller: selectLsb, value: 127));
+    }
+    return messages;
+  }
+}
+
+// =============================================================================
 // MidiOutput - Send MIDI messages
 // =============================================================================
 
@@ -865,6 +1122,10 @@ class MidiObserver {
 class MidiOutput {
   Pointer<LrmMidiOut>? _handle;
   bool _disposed = false;
+
+  /// Invoked once when this output is disposed. Set by [LibremidiFlutter] so
+  /// its registry cannot go stale when callers dispose the output directly.
+  void Function()? _onDispose;
 
   MidiOutput._byId(Pointer<LrmObserver> observer, int portId) {
     _handle = _bindings.lrm_midi_out_open_by_id(observer, portId);
@@ -910,58 +1171,49 @@ class MidiOutput {
     }
   }
 
+  /// Sends every message of [messages] in list order.
+  void _sendAll(List<Uint8List> messages) {
+    for (final message in messages) {
+      send(message);
+    }
+  }
+
   /// Sends a Note On message.
   void sendNoteOn({
     required int channel,
     required int note,
     required int velocity,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(note, 0, 127, 'note');
-    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
-    send(Uint8List.fromList([0x90 | channel, note, velocity]));
-  }
+  }) =>
+      send(MidiMessageBuilder.noteOn(
+          channel: channel, note: note, velocity: velocity));
 
   /// Sends a Note Off message.
   void sendNoteOff({
     required int channel,
     required int note,
     int velocity = 0,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(note, 0, 127, 'note');
-    RangeError.checkValueInInterval(velocity, 0, 127, 'velocity');
-    send(Uint8List.fromList([0x80 | channel, note, velocity]));
-  }
+  }) =>
+      send(MidiMessageBuilder.noteOff(
+          channel: channel, note: note, velocity: velocity));
 
   /// Sends a Control Change message.
   void sendControlChange({
     required int channel,
     required int controller,
     required int value,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(controller, 0, 127, 'controller');
-    RangeError.checkValueInInterval(value, 0, 127, 'value');
-    send(Uint8List.fromList([0xB0 | channel, controller, value]));
-  }
+  }) =>
+      send(MidiMessageBuilder.controlChange(
+          channel: channel, controller: controller, value: value));
 
   /// Sends a Program Change message.
-  void sendProgramChange({required int channel, required int program}) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(program, 0, 127, 'program');
-    send(Uint8List.fromList([0xC0 | channel, program]));
-  }
+  void sendProgramChange({required int channel, required int program}) =>
+      send(MidiMessageBuilder.programChange(
+          channel: channel, program: program));
 
   /// Sends a Pitch Bend message.
   /// Value is 14-bit (0-16383), center is 8192.
-  void sendPitchBend({required int channel, required int value}) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(value, 0, 16383, 'value');
-    final lsb = value & 0x7F;
-    final msb = (value >> 7) & 0x7F;
-    send(Uint8List.fromList([0xE0 | channel, lsb, msb]));
-  }
+  void sendPitchBend({required int channel, required int value}) =>
+      send(MidiMessageBuilder.pitchBend(channel: channel, value: value));
 
   /// Sends Bank Select (CC 0 = MSB, CC 32 = LSB) followed by Program Change.
   ///
@@ -972,16 +1224,9 @@ class MidiOutput {
     required int channel,
     required int bank,
     required int program,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(bank, 0, 16383, 'bank');
-    RangeError.checkValueInInterval(program, 0, 127, 'program');
-    final msb = (bank >> 7) & 0x7F;
-    final lsb = bank & 0x7F;
-    sendControlChange(channel: channel, controller: 0, value: msb);
-    sendControlChange(channel: channel, controller: 32, value: lsb);
-    sendProgramChange(channel: channel, program: program);
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.bankSelect(
+          channel: channel, bank: bank, program: program));
 
   /// Sends a Registered Parameter Number (RPN) value.
   ///
@@ -998,35 +1243,15 @@ class MidiOutput {
     required int value,
     bool fourteenBit = true,
     bool deselect = true,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
-    RangeError.checkValueInInterval(
-      value,
-      0,
-      fourteenBit ? 16383 : 127,
-      'value',
-    );
-
-    final parameterMsb = (parameter >> 7) & 0x7F;
-    final parameterLsb = parameter & 0x7F;
-    sendControlChange(channel: channel, controller: 101, value: parameterMsb);
-    sendControlChange(channel: channel, controller: 100, value: parameterLsb);
-
-    if (fourteenBit) {
-      final valueMsb = (value >> 7) & 0x7F;
-      final valueLsb = value & 0x7F;
-      sendControlChange(channel: channel, controller: 6, value: valueMsb);
-      sendControlChange(channel: channel, controller: 38, value: valueLsb);
-    } else {
-      sendControlChange(channel: channel, controller: 6, value: value);
-    }
-
-    if (deselect) {
-      sendControlChange(channel: channel, controller: 101, value: 127);
-      sendControlChange(channel: channel, controller: 100, value: 127);
-    }
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumber(
+        channel: channel,
+        parameter: parameter,
+        value: value,
+        registered: true,
+        fourteenBit: fourteenBit,
+        deselect: deselect,
+      ));
 
   /// Sends a Data Increment for a Registered Parameter Number (RPN).
   ///
@@ -1038,15 +1263,15 @@ class MidiOutput {
     required int parameter,
     int amount = 1,
     bool deselect = true,
-  }) {
-    _sendRpnRelative(
-      channel: channel,
-      parameter: parameter,
-      controller: 96,
-      amount: amount,
-      deselect: deselect,
-    );
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumberRelative(
+        channel: channel,
+        parameter: parameter,
+        registered: true,
+        increment: true,
+        amount: amount,
+        deselect: deselect,
+      ));
 
   /// Sends a Data Decrement for a Registered Parameter Number (RPN).
   ///
@@ -1058,15 +1283,15 @@ class MidiOutput {
     required int parameter,
     int amount = 1,
     bool deselect = true,
-  }) {
-    _sendRpnRelative(
-      channel: channel,
-      parameter: parameter,
-      controller: 97,
-      amount: amount,
-      deselect: deselect,
-    );
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumberRelative(
+        channel: channel,
+        parameter: parameter,
+        registered: true,
+        increment: false,
+        amount: amount,
+        deselect: deselect,
+      ));
 
   /// Sends a Non-Registered Parameter Number (NRPN) value.
   ///
@@ -1083,35 +1308,15 @@ class MidiOutput {
     required int value,
     bool fourteenBit = true,
     bool deselect = true,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
-    RangeError.checkValueInInterval(
-      value,
-      0,
-      fourteenBit ? 16383 : 127,
-      'value',
-    );
-
-    final parameterMsb = (parameter >> 7) & 0x7F;
-    final parameterLsb = parameter & 0x7F;
-    sendControlChange(channel: channel, controller: 99, value: parameterMsb);
-    sendControlChange(channel: channel, controller: 98, value: parameterLsb);
-
-    if (fourteenBit) {
-      final valueMsb = (value >> 7) & 0x7F;
-      final valueLsb = value & 0x7F;
-      sendControlChange(channel: channel, controller: 6, value: valueMsb);
-      sendControlChange(channel: channel, controller: 38, value: valueLsb);
-    } else {
-      sendControlChange(channel: channel, controller: 6, value: value);
-    }
-
-    if (deselect) {
-      sendControlChange(channel: channel, controller: 99, value: 127);
-      sendControlChange(channel: channel, controller: 98, value: 127);
-    }
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumber(
+        channel: channel,
+        parameter: parameter,
+        value: value,
+        registered: false,
+        fourteenBit: fourteenBit,
+        deselect: deselect,
+      ));
 
   /// Sends a Data Increment for a Non-Registered Parameter Number (NRPN).
   ///
@@ -1123,15 +1328,15 @@ class MidiOutput {
     required int parameter,
     int amount = 1,
     bool deselect = true,
-  }) {
-    _sendNrpnRelative(
-      channel: channel,
-      parameter: parameter,
-      controller: 96,
-      amount: amount,
-      deselect: deselect,
-    );
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumberRelative(
+        channel: channel,
+        parameter: parameter,
+        registered: false,
+        increment: true,
+        amount: amount,
+        deselect: deselect,
+      ));
 
   /// Sends a Data Decrement for a Non-Registered Parameter Number (NRPN).
   ///
@@ -1143,105 +1348,53 @@ class MidiOutput {
     required int parameter,
     int amount = 1,
     bool deselect = true,
-  }) {
-    _sendNrpnRelative(
-      channel: channel,
-      parameter: parameter,
-      controller: 97,
-      amount: amount,
-      deselect: deselect,
-    );
-  }
-
-  void _sendRpnRelative({
-    required int channel,
-    required int parameter,
-    required int controller,
-    required int amount,
-    required bool deselect,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
-    RangeError.checkValueInInterval(amount, 0, 127, 'amount');
-
-    final parameterMsb = (parameter >> 7) & 0x7F;
-    final parameterLsb = parameter & 0x7F;
-    sendControlChange(channel: channel, controller: 101, value: parameterMsb);
-    sendControlChange(channel: channel, controller: 100, value: parameterLsb);
-    sendControlChange(channel: channel, controller: controller, value: amount);
-
-    if (deselect) {
-      sendControlChange(channel: channel, controller: 101, value: 127);
-      sendControlChange(channel: channel, controller: 100, value: 127);
-    }
-  }
-
-  void _sendNrpnRelative({
-    required int channel,
-    required int parameter,
-    required int controller,
-    required int amount,
-    required bool deselect,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(parameter, 0, 16383, 'parameter');
-    RangeError.checkValueInInterval(amount, 0, 127, 'amount');
-
-    final parameterMsb = (parameter >> 7) & 0x7F;
-    final parameterLsb = parameter & 0x7F;
-    sendControlChange(channel: channel, controller: 99, value: parameterMsb);
-    sendControlChange(channel: channel, controller: 98, value: parameterLsb);
-    sendControlChange(channel: channel, controller: controller, value: amount);
-
-    if (deselect) {
-      sendControlChange(channel: channel, controller: 99, value: 127);
-      sendControlChange(channel: channel, controller: 98, value: 127);
-    }
-  }
+  }) =>
+      _sendAll(MidiMessageBuilder.parameterNumberRelative(
+        channel: channel,
+        parameter: parameter,
+        registered: false,
+        increment: false,
+        amount: amount,
+        deselect: deselect,
+      ));
 
   /// Sends a SysEx message.
   ///
   /// By default, [data] should NOT include 0xF0/0xF7 framing bytes - they
   /// will be added automatically. Set [alreadyFramed] to true if [data]
   /// already includes the framing bytes (starts with 0xF0, ends with 0xF7).
-  void sendSysEx(Uint8List data, {bool alreadyFramed = false}) {
-    if (alreadyFramed) {
-      send(data);
-    } else {
-      final message = Uint8List(data.length + 2);
-      message[0] = 0xF0;
-      message.setRange(1, data.length + 1, data);
-      message[data.length + 1] = 0xF7;
-      send(message);
-    }
-  }
+  void sendSysEx(Uint8List data, {bool alreadyFramed = false}) =>
+      send(MidiMessageBuilder.sysEx(data, alreadyFramed: alreadyFramed));
 
   /// Sends Channel Aftertouch (Channel Pressure).
-  void sendAftertouch({required int channel, required int pressure}) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
-    send(Uint8List.fromList([0xD0 | channel, pressure]));
-  }
+  void sendAftertouch({required int channel, required int pressure}) =>
+      send(MidiMessageBuilder.aftertouch(
+          channel: channel, pressure: pressure));
 
   /// Sends Polyphonic Aftertouch (Key Pressure).
   void sendPolyAftertouch({
     required int channel,
     required int note,
     required int pressure,
-  }) {
-    RangeError.checkValueInInterval(channel, 0, 15, 'channel');
-    RangeError.checkValueInInterval(note, 0, 127, 'note');
-    RangeError.checkValueInInterval(pressure, 0, 127, 'pressure');
-    send(Uint8List.fromList([0xA0 | channel, note, pressure]));
-  }
+  }) =>
+      send(MidiMessageBuilder.polyAftertouch(
+          channel: channel, note: note, pressure: pressure));
 
   /// Closes the output connection and releases resources.
   void dispose() {
-    if (!_disposed && _handle != null) {
+    if (_disposed) return;
+    _disposed = true;
+    if (_handle != null) {
       _bindings.lrm_midi_out_close(_handle!);
       _handle = null;
-      _disposed = true;
     }
+    // Tell the LibremidiFlutter registry (if this output came from there) that
+    // the port is free again. Without it, disposing directly instead of via
+    // LibremidiFlutter.disconnectOutput left a stale entry behind and every
+    // later openOutput() for the same port threw "already open" forever.
+    final onDispose = _onDispose;
+    _onDispose = null;
+    onDispose?.call();
   }
 }
 
@@ -1257,6 +1410,10 @@ class MidiInput {
       _callback;
   final StreamController<MidiMessage> _messageController =
       StreamController<MidiMessage>.broadcast();
+
+  /// Invoked once when this input is disposed. Set by [LibremidiFlutter] so
+  /// its registry cannot go stale when callers dispose the input directly.
+  void Function()? _onDispose;
 
   MidiInput._byId(
     Pointer<LrmObserver> observer,
@@ -1294,8 +1451,15 @@ class MidiInput {
     // [data] is an owning heap copy allocated by the native callback (the
     // libremidi message buffer itself is reused and would be overwritten before
     // this listener runs on the event loop). Copy it out, then release it via
-    // lrm_free — also when disposed, so buffers for messages still queued at
-    // dispose time are not leaked.
+    // lrm_free — this happens even after dispose, so a message that still
+    // reaches this listener during teardown does not leak.
+    //
+    // Invocations that are still queued when dispose() calls
+    // NativeCallable.close() are dropped by the runtime and never reach this
+    // method. The native side therefore owns these buffers and reclaims
+    // whatever is still outstanding when the input closes; lrm_free ignores a
+    // pointer that was already reclaimed, so a late delivery cannot double
+    // free.
     final bytes = Uint8List(length);
     if (length > 0) {
       bytes.setAll(0, data.asTypedList(length));
@@ -1367,18 +1531,27 @@ class MidiInput {
 
   /// Closes the input connection and releases resources.
   void dispose() {
-    if (!_disposed && _handle != null) {
-      // Order matters to avoid use-after-free:
-      // 1. Mark disposed first to reject new callbacks in Dart
-      _disposed = true;
-      // 2. Close native MIDI input first (stops the native producer)
+    if (_disposed) return;
+    // Order matters to avoid use-after-free:
+    // 1. Mark disposed first to reject new callbacks in Dart
+    _disposed = true;
+    // 2. Close the native MIDI input first. This stops the native producer and
+    //    waits for a delivery that is already inside the native callback.
+    if (_handle != null) {
       _bindings.lrm_midi_in_close(_handle!);
       _handle = null;
-      // 3. Now safe to close the callable (no native code can call it)
-      _callback?.close();
-      // 4. Close Dart stream controller
-      _messageController.close();
     }
+    // 3. Now safe to close the callable (no native code can call it)
+    _callback?.close();
+    // 4. Close Dart stream controller
+    _messageController.close();
+    // 5. Tell the LibremidiFlutter registry (if this input came from there)
+    //    that the port is free again — otherwise disposing directly instead of
+    //    via disconnectInput() left a stale entry and every later openInput()
+    //    for the same port threw "already open" forever.
+    final onDispose = _onDispose;
+    _onDispose = null;
+    onDispose?.call();
   }
 }
 
@@ -1411,6 +1584,10 @@ class LibremidiFlutter {
   /// Stream of hotplug events (device added/removed).
   static Stream<HotplugEventType> get onHotplug => _ensureObserver.onHotplug;
 
+  /// Whether hotplug events can actually be delivered.
+  /// See [MidiObserver.hotplugAvailable].
+  static bool get hotplugAvailable => _ensureObserver.hotplugAvailable;
+
   /// Gets all available MIDI input ports.
   static List<MidiPort> getInputPorts() {
     return _ensureObserver.getInputPorts();
@@ -1440,6 +1617,9 @@ class LibremidiFlutter {
     }
     final output = _ensureObserver.openOutput(port);
     _openOutputs[port.portId] = output;
+    // Keep the registry in sync even when the caller disposes the output
+    // directly instead of going through disconnectOutput().
+    output._onDispose = () => _openOutputs.remove(port.portId);
     return output;
   }
 
@@ -1465,11 +1645,16 @@ class LibremidiFlutter {
       receiveSensing: receiveSensing,
     );
     _openInputs[port.portId] = input;
+    // Keep the registry in sync even when the caller disposes the input
+    // directly instead of going through disconnectInput().
+    input._onDispose = () => _openInputs.remove(port.portId);
     return input;
   }
 
   /// Disconnects a specific MIDI input.
   static void disconnectInput(MidiInput input) {
+    // dispose() removes the registry entry through the _onDispose hook. The
+    // removeWhere below still covers inputs that were never registered here.
     input.dispose();
     _openInputs.removeWhere((_, v) => v == input);
   }
@@ -1482,12 +1667,15 @@ class LibremidiFlutter {
 
   /// Disconnects all open MIDI connections (inputs and outputs).
   static void disconnectAll() {
-    for (final input in _openInputs.values) {
+    // Iterate over copies: dispose() now mutates these maps through the
+    // _onDispose hook, which would throw ConcurrentModificationError if we
+    // walked the live map.
+    for (final input in _openInputs.values.toList()) {
       input.dispose();
     }
     _openInputs.clear();
 
-    for (final output in _openOutputs.values) {
+    for (final output in _openOutputs.values.toList()) {
       output.dispose();
     }
     _openOutputs.clear();

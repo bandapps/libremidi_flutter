@@ -8,7 +8,14 @@
 #if _WIN32
 #define FFI_PLUGIN_EXPORT __declspec(dllexport)
 #else
-#define FFI_PLUGIN_EXPORT __attribute__((visibility("default")))
+// `used` is required in addition to default visibility on the Apple platforms.
+// SwiftPM links the plugin's objects statically into the runner binary, and
+// nothing references these FFI entry points at link time — Dart looks them up
+// at runtime via DynamicLibrary.process(). Without `used` (which emits the
+// Mach-O .no_dead_strip directive) Xcode's Release dead-code stripping removes
+// them and every lookup fails with "Failed to lookup symbol". Debug builds do
+// not strip, which is why this only ever showed up in Release.
+#define FFI_PLUGIN_EXPORT __attribute__((visibility("default"), used))
 #endif
 
 #ifdef __cplusplus
@@ -118,6 +125,22 @@ FFI_PLUGIN_EXPORT void lrm_observer_free(LrmObserver* observer);
 
 // Refresh port list
 FFI_PLUGIN_EXPORT void lrm_observer_refresh(LrmObserver* observer);
+
+// Whether this observer can actually deliver hotplug events *right now*.
+//
+// Returns false for an observer created without a hotplug callback, and — on
+// iOS/macOS — also when the CoreMIDI notification client could not be created
+// (e.g. kMIDINoConnection when the MIDI server is unreachable). Port
+// enumeration still works in that case, so the failure is otherwise invisible:
+// the port list is correct and the initial setup_changed event still arrives,
+// but no further hotplug notification ever will.
+//
+// On iOS/macOS this is false until the observer's background initialisation
+// has finished, so a caller asking immediately after creating the observer
+// gets false. Check it again once the first setup_changed event has arrived:
+// that event is emitted right after the notification client is set up, so by
+// then the answer is final.
+FFI_PLUGIN_EXPORT bool lrm_observer_hotplug_available(LrmObserver* observer);
 
 // Get count of available input ports
 FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input_count(LrmObserver* observer);

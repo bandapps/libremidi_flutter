@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.6
+
+### Fixed
+
+- **iOS and macOS did not work in released apps.** Depending on the build system the plugin either shipped without its native code or had its symbols stripped, both failing at runtime with `Failed to lookup symbol 'lrm_...'`. Both build systems are fixed and verified.
+- **Windows fell back to WinUWP** instead of Windows MIDI Services, because the bundled SDK headers were missing from the published package. Also affected 0.8.5.
+- Reliability work in the native layer across all platforms: closing ports and observers, hotplug handling, Android's asynchronous device opening, and error reporting. Failed opens and sends previously reported success; they now surface as exceptions.
+
+### Added
+
+- `MidiMessageBuilder` — the byte builders behind every `MidiOutput.send*` method, usable without an open port.
+- `MidiObserver.hotplugAvailable` / `LibremidiFlutter.hotplugAvailable` to detect the case where hotplug cannot be delivered, so an app can fall back to polling.
+
+### Changed
+
+- **Port ids changed on Windows MIDI Services and Android.** They were derived from values that shifted when devices were added or removed. Persist a selection with `MidiPort.toMatchJson` and restore it with `findClosestPort` rather than storing `portId`.
+- `MidiMessage.timestamp` is documented as nanoseconds, which is what it has always been — the previous "microseconds" was a documentation error. Values are unchanged.
+- Dart SDK constraint raised to `^3.7.0`, which `ffi ^2.2.0` already required.
+
 ## 0.8.5
 
 ### Added

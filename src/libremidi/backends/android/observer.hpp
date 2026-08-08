@@ -83,7 +83,7 @@ public:
       // Unregister device callback
       if (midi_manager && device_callback)
       {
-        android::clear_hotplug_observer();
+        android::clear_hotplug_observer(this);
         context::unregister_device_callback(env, midi_manager, device_callback);
         device_callback = nullptr;
       }
@@ -113,6 +113,11 @@ public:
     if (!ctx)
       return {};
 
+    // Hold the cache lock across the refresh *and* all the positional reads
+    // below: the entries are indexed by position, so another direction's
+    // enumeration running in between would swap the list out under us and free
+    // the global references we are about to read.
+    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
     context::refresh_midi_devices(env, ctx, false);
 
     std::vector<libremidi::input_port> ports;
@@ -174,6 +179,8 @@ public:
     if (!ctx)
       return {};
 
+    // See get_input_ports: refresh and positional reads are one atomic unit.
+    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
     context::refresh_midi_devices(env, ctx, true);
 
     std::vector<libremidi::output_port> ports;

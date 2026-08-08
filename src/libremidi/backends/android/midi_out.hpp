@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <mutex>
 #include <libremidi/backends/android/config.hpp>
 #include <libremidi/backends/android/helpers.hpp>
 #include <libremidi/detail/midi_out.hpp>
@@ -35,10 +37,10 @@ public:
 
   stdx::error open_port(const output_port& port, std::string_view /*name*/) override
   {
-    if (is_port_open())
+    if (port_requested)
     {
       libremidi_handle_error(configuration, "midi_out::open_port: a port is already open");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
     const unsigned int port_number = port.port;
@@ -47,80 +49,132 @@ public:
     if (!env)
     {
       libremidi_handle_error(configuration, "midi_out::open_port: failed to get JNI environment");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
     auto ctx = context::get_context(env);
     if (!ctx)
     {
       libremidi_handle_error(configuration, "midi_out::open_port: failed to get Android context");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
+    // The index below refers to the list this refresh produces, so both must
+    // happen under one lock.
+    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
     context::refresh_midi_devices(env, ctx, true);
 
     if (port_number >= context::midi_ports.size())
     {
       libremidi_handle_error(configuration, "midi_out::open_port: invalid port number");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
-    port_open = true;
-    context::open_device(context::midi_ports[port_number], this, true);
+    port_requested = true;
+    // See midi_in::open_port: Java gets a token carrying both this object and
+    // the port index, never a raw pointer or a shared index.
+    const auto& entry = context::midi_ports[port_number];
+    const int64_t token = register_pending_open(this, entry.port_index, true);
+    if (!context::open_device(entry, token, true))
+    {
+      // Nothing reached Java, so no callback will arrive to clear this.
+      port_requested = false;
+      libremidi_handle_error(configuration, "midi_out::open_port: openDevice failed");
+      return std::errc::io_error;
+    }
     return stdx::error{};
   }
 
   stdx::error close_port() override
   {
-    if (!is_port_open())
+    // Drop a not-yet-delivered open before this object can be destroyed.
+    cancel_pending_open(this);
+
+    if (!port_requested)
       return std::errc{};
+    port_requested = false;
 
-    if (midi_input_port)
+    // Take the handles under port_mutex so a send that already loaded the port
+    // has finished before it is closed. The atomic load alone only rules out a
+    // torn pointer; it does not stop AMidiInputPort_close() from running
+    // between that load and AMidiInputPort_send().
+    AMidiInputPort* port = nullptr;
+    AMidiDevice* device = nullptr;
     {
-      AMidiInputPort_close(midi_input_port);
-      midi_input_port = nullptr;
+      std::lock_guard<std::mutex> lock(port_mutex);
+      port = midi_input_port.exchange(nullptr, std::memory_order_acq_rel);
+      device = send_device.exchange(nullptr, std::memory_order_acq_rel);
     }
 
-    if (send_device)
-    {
-      AMidiDevice_release(send_device);
-      send_device = nullptr;
-    }
+    if (port)
+      AMidiInputPort_close(port);
+    if (device)
+      AMidiDevice_release(device);
 
-    port_open = false;
     return stdx::error{};
   }
 
-  bool is_port_open() const noexcept { return port_open; }
+  // Reports the actual state: opening is asynchronous on Android, so an
+  // optimistic flag claimed "open" while a send still failed.
+  bool is_port_open() const noexcept
+  {
+    return midi_input_port.load(std::memory_order_acquire) != nullptr;
+  }
+
+  // Clears the requested state when no callback will ever arrive.
+  static void open_failed(midi_out* self) noexcept { self->port_requested = false; }
 
   stdx::error send_message(const unsigned char* message, size_t size) override
   {
-    if (!is_port_open() || !midi_input_port)
+    // Hold port_mutex across the load *and* the send: close_port() takes the
+    // same lock before closing, so the handle cannot be closed underneath a
+    // send that is already running.
+    ssize_t result = 0;
     {
-      libremidi_handle_error(configuration, "midi_out::send_message: port is not open");
-      return std::errc{};
+      std::lock_guard<std::mutex> lock(port_mutex);
+      AMidiInputPort* const port = midi_input_port.load(std::memory_order_acquire);
+      if (!port)
+      {
+        libremidi_handle_error(configuration, "midi_out::send_message: port is not open");
+        return std::errc::io_error;
+      }
+      result = AMidiInputPort_send(port, message, size);
     }
 
-    ssize_t result = AMidiInputPort_send(midi_input_port, message, size);
     if (result < 0)
     {
       libremidi_handle_error(configuration, "midi_out::send_message: failed to send MIDI data");
-      return std::errc{};
+      return std::errc::io_error;
     }
     return stdx::error{};
   }
 
-  static void open_callback(midi_out* self, AMidiDevice* device)
+  static void open_callback(midi_out* self, AMidiDevice* device, int port_index)
   {
-    self->send_device = device;
-    AMidiInputPort_open(device, context::pending_port_index, &self->midi_input_port);
+    AMidiInputPort* port = nullptr;
+    if (AMidiInputPort_open(device, port_index, &port) != AMEDIA_OK)
+    {
+      LOGE("AMidiInputPort_open failed for port %d", port_index);
+      // See midi_in: close_port() bails out early, so release the device here
+      // rather than leaking it.
+      AMidiDevice_release(device);
+      open_failed(self);
+      return;
+    }
+    self->send_device.store(device, std::memory_order_release);
+    self->midi_input_port.store(port, std::memory_order_release);
   }
 
 private:
   libremidi::output_configuration configuration;
-  AMidiDevice* send_device = nullptr;
-  AMidiInputPort* midi_input_port = nullptr;
-  bool port_open = false;
+  // See midi_in: written by the Java open callback, cleared by the caller in
+  // close_port(), and read by send_message() and is_port_open() from whichever
+  // thread the application uses.
+  // Serialises sending against closing; see send_message() and close_port().
+  mutable std::mutex port_mutex;
+  std::atomic<AMidiDevice*> send_device{nullptr};
+  std::atomic<AMidiInputPort*> midi_input_port{nullptr};
+  std::atomic<bool> port_requested{false};
 };
 }
 }

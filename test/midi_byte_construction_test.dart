@@ -3,576 +3,237 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
 
-/// These tests verify that MIDI byte patterns (as constructed by MidiOutput
-/// send methods) are correctly parsed back by MidiMessage. This validates
-/// the MIDI protocol implementation without requiring native FFI.
-
+/// Pins the bytes that `MidiOutput.send*` puts on the wire.
+///
+/// Every `MidiOutput.send*` method is a one-line delegation to
+/// [MidiMessageBuilder], so asserting on the builder asserts on the production
+/// encoder — the previous version of this file rebuilt the byte patterns inside
+/// the test and therefore stayed green no matter what `MidiOutput` actually
+/// sent (a swapped pitch-bend LSB/MSB or a reordered RPN sequence went
+/// unnoticed).
+///
+/// `MidiOutput` itself cannot be constructed without an open native port, so
+/// the delegation from `send*` to the builder is not covered here; the byte
+/// layout below is.
 void main() {
-  group('Note On byte construction', () {
-    test('channel 0, note 60, velocity 100', () {
-      final bytes = Uint8List.fromList([0x90 | 0, 60 & 0x7F, 100 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isNoteOn, isTrue);
-      expect(msg.isNoteOff, isFalse);
-      expect(msg.channel, 0);
-      expect(msg.note, 60);
-      expect(msg.velocity, 100);
+  group('channel voice messages', () {
+    test('note on/off carry status nibble, note and velocity in order', () {
+      // Regression: a swapped note/velocity or a wrong status nibble would
+      // play the wrong pitch on every device.
+      expect(MidiMessageBuilder.noteOn(channel: 0, note: 60, velocity: 100),
+          [0x90, 60, 100]);
+      expect(MidiMessageBuilder.noteOn(channel: 15, note: 127, velocity: 1),
+          [0x9F, 127, 1]);
+      expect(MidiMessageBuilder.noteOff(channel: 5, note: 72, velocity: 64),
+          [0x85, 72, 64]);
     });
 
-    test('channel 15, note 127, velocity 127', () {
-      final bytes = Uint8List.fromList([0x90 | 15, 127 & 0x7F, 127 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isNoteOn, isTrue);
-      expect(msg.channel, 15);
-      expect(msg.note, 127);
-      expect(msg.velocity, 127);
+    test('note off defaults to velocity 0', () {
+      expect(MidiMessageBuilder.noteOff(channel: 0, note: 60), [0x80, 60, 0]);
     });
 
-    test('channel 0, note 0, velocity 1 (minimum non-zero)', () {
-      final bytes = Uint8List.fromList([0x90, 0, 1]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isNoteOn, isTrue);
-      expect(msg.note, 0);
-      expect(msg.velocity, 1);
-    });
-  });
-
-  group('Note Off byte construction', () {
-    test('explicit Note Off (0x80)', () {
-      final bytes = Uint8List.fromList([0x80 | 0, 60 & 0x7F, 64 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isNoteOff, isTrue);
-      expect(msg.isNoteOn, isFalse);
-      expect(msg.channel, 0);
-      expect(msg.note, 60);
-      expect(msg.velocity, 64);
+    test('program change and channel aftertouch are two bytes', () {
+      // Regression: emitting a third byte here desynchronises the receiver's
+      // running-status parser, which then misreads the next message.
+      expect(MidiMessageBuilder.programChange(channel: 9, program: 127),
+          [0xC9, 127]);
+      expect(MidiMessageBuilder.aftertouch(channel: 15, pressure: 100),
+          [0xDF, 100]);
+      expect(
+          MidiMessageBuilder.polyAftertouch(
+              channel: 0, note: 60, pressure: 80),
+          [0xA0, 60, 80]);
     });
 
-    test('Note On with velocity 0 is Note Off', () {
-      final bytes = Uint8List.fromList([0x90 | 5, 72, 0]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isNoteOff, isTrue);
-      expect(msg.isNoteOn, isFalse);
-      expect(msg.channel, 5);
-      expect(msg.note, 72);
+    test('control change puts controller before value', () {
+      expect(
+          MidiMessageBuilder.controlChange(
+              channel: 3, controller: 64, value: 127),
+          [0xB3, 64, 127]);
     });
   });
 
-  group('Control Change byte construction', () {
-    test('volume (CC 7) on channel 0', () {
-      final bytes = Uint8List.fromList([0xB0 | 0, 7 & 0x7F, 100 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isControlChange, isTrue);
-      expect(msg.channel, 0);
-      expect(msg.controller, 7);
-      expect(msg.value, 100);
+  group('pitch bend', () {
+    test('sends LSB first, then MSB', () {
+      // Regression: pitch bend is the one 14-bit message that goes LSB first,
+      // the opposite of the RPN/NRPN parameter encoding. Swapping the two
+      // bytes turns a centred bend (8192) into a near-maximum bend.
+      expect(MidiMessageBuilder.pitchBend(channel: 0, value: 8192),
+          [0xE0, 0x00, 0x40]);
+      expect(MidiMessageBuilder.pitchBend(channel: 7, value: 1),
+          [0xE7, 0x01, 0x00]);
+      expect(MidiMessageBuilder.pitchBend(channel: 0, value: 16383),
+          [0xE0, 0x7F, 0x7F]);
     });
 
-    test('sustain pedal (CC 64) on, channel 3', () {
-      final bytes = Uint8List.fromList([0xB0 | 3, 64, 127]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isControlChange, isTrue);
-      expect(msg.channel, 3);
-      expect(msg.controller, 64);
-      expect(msg.value, 127);
-    });
-
-    test('sustain pedal (CC 64) off', () {
-      final bytes = Uint8List.fromList([0xB0, 64, 0]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isControlChange, isTrue);
-      expect(msg.controller, 64);
-      expect(msg.value, 0);
-    });
-
-    test('modulation wheel (CC 1)', () {
-      final bytes = Uint8List.fromList([0xB0, 1, 64]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isControlChange, isTrue);
-      expect(msg.controller, 1);
-      expect(msg.value, 64);
-    });
-
-    test('all controllers 0-127 produce valid CC messages', () {
-      for (var cc = 0; cc < 128; cc++) {
-        final bytes = Uint8List.fromList([0xB0, cc, 0]);
-        final msg = MidiMessage(bytes);
-        expect(msg.isControlChange, isTrue, reason: 'CC $cc');
-        expect(msg.controller, cc, reason: 'CC $cc');
-      }
-    });
-  });
-
-  group('Program Change byte construction', () {
-    test('program 0 on channel 0', () {
-      final bytes = Uint8List.fromList([0xC0 | 0, 0 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isProgramChange, isTrue);
-      expect(msg.channel, 0);
-      expect(msg.note, 0); // byte 1 accessor
-    });
-
-    test('program 127 on channel 9 (drums)', () {
-      final bytes = Uint8List.fromList([0xC0 | 9, 127]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isProgramChange, isTrue);
-      expect(msg.channel, 9);
-      expect(msg.note, 127); // program stored in byte 1
-    });
-
-    test('all programs 0-127', () {
-      for (var prog = 0; prog < 128; prog++) {
-        final bytes = Uint8List.fromList([0xC0, prog]);
-        final msg = MidiMessage(bytes);
-        expect(msg.isProgramChange, isTrue, reason: 'program $prog');
-      }
-    });
-  });
-
-  group('Pitch Bend byte construction', () {
-    test('center value (8192)', () {
-      const value = 8192;
-      final lsb = value & 0x7F;
-      final msb = (value >> 7) & 0x7F;
-      final bytes = Uint8List.fromList([0xE0 | 0, lsb, msb]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPitchBend, isTrue);
-      expect(msg.channel, 0);
-      // Reconstruct 14-bit value from parsed bytes
-      final reconstructed = msg.data[1] | (msg.data[2] << 7);
-      expect(reconstructed, 8192);
-    });
-
-    test('minimum value (0)', () {
-      final bytes = Uint8List.fromList([0xE0, 0, 0]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPitchBend, isTrue);
-      final reconstructed = msg.data[1] | (msg.data[2] << 7);
-      expect(reconstructed, 0);
-    });
-
-    test('maximum value (16383)', () {
-      const value = 16383;
-      final lsb = value & 0x7F;
-      final msb = (value >> 7) & 0x7F;
-      final bytes = Uint8List.fromList([0xE0, lsb, msb]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPitchBend, isTrue);
-      final reconstructed = msg.data[1] | (msg.data[2] << 7);
-      expect(reconstructed, 16383);
-    });
-
-    test('pitch bend on channel 7', () {
-      final bytes = Uint8List.fromList([0xE0 | 7, 0, 64]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPitchBend, isTrue);
-      expect(msg.channel, 7);
-    });
-
-    test('14-bit roundtrip for various values', () {
+    test('round-trips through MidiMessage parsing', () {
       for (final value in [0, 1, 64, 8191, 8192, 8193, 16382, 16383]) {
-        final lsb = value & 0x7F;
-        final msb = (value >> 7) & 0x7F;
-        final bytes = Uint8List.fromList([0xE0, lsb, msb]);
-        final msg = MidiMessage(bytes);
-        final reconstructed = msg.data[1] | (msg.data[2] << 7);
-        expect(reconstructed, value, reason: 'pitch bend $value');
+        final msg =
+            MidiMessage(MidiMessageBuilder.pitchBend(channel: 0, value: value));
+        expect(msg.isPitchBend, isTrue);
+        expect(msg.data[1] | (msg.data[2] << 7), value,
+            reason: 'pitch bend $value');
       }
     });
   });
 
-  group('SysEx byte construction', () {
-    test('unframed data gets framed with F0/F7', () {
+  group('SysEx', () {
+    test('adds F0/F7 framing by default and leaves framed data alone', () {
       final payload = Uint8List.fromList([0x7E, 0x7F, 0x09, 0x01]);
-      final message = Uint8List(payload.length + 2);
-      message[0] = 0xF0;
-      message.setRange(1, payload.length + 1, payload);
-      message[payload.length + 1] = 0xF7;
+      expect(MidiMessageBuilder.sysEx(payload),
+          [0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
 
-      final msg = MidiMessage(message);
-      expect(msg.isSysEx, isTrue);
-      expect(msg.data.first, 0xF0);
-      expect(msg.data.last, 0xF7);
-      expect(msg.data.length, 6);
-    });
-
-    test('already framed data passes through', () {
+      // Regression: framing already-framed data would produce F0 F0 ... F7 F7,
+      // which most devices drop silently.
       final framed = Uint8List.fromList([0xF0, 0x43, 0x12, 0xF7]);
-      final msg = MidiMessage(framed);
-      expect(msg.isSysEx, isTrue);
-      expect(msg.data, framed);
-    });
-
-    test('SysEx is not Note On/Off/CC/PC/PitchBend', () {
-      final msg = MidiMessage(Uint8List.fromList([0xF0, 0x00, 0xF7]));
-      expect(msg.isSysEx, isTrue);
-      expect(msg.isNoteOn, isFalse);
-      expect(msg.isNoteOff, isFalse);
-      expect(msg.isControlChange, isFalse);
-      expect(msg.isProgramChange, isFalse);
-      expect(msg.isPitchBend, isFalse);
-      expect(msg.isAftertouch, isFalse);
-      expect(msg.isPolyAftertouch, isFalse);
+      expect(MidiMessageBuilder.sysEx(framed, alreadyFramed: true), framed);
     });
   });
 
-  group('Channel Aftertouch byte construction', () {
-    test('channel 0, pressure 100', () {
-      final bytes = Uint8List.fromList([0xD0 | 0, 100 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isAftertouch, isTrue);
-      expect(msg.isPolyAftertouch, isFalse);
-      expect(msg.channel, 0);
-      expect(msg.note, 100); // pressure is in byte 1
+  group('bank select', () {
+    test('sends CC 0 (MSB), CC 32 (LSB), then the program change', () {
+      // Regression: the program change must come last — a device that receives
+      // it before the bank CCs selects the program from the *old* bank.
+      final messages =
+          MidiMessageBuilder.bankSelect(channel: 2, bank: 129, program: 5);
+      expect(messages, [
+        [0xB2, 0, 1],
+        [0xB2, 32, 1],
+        [0xC2, 5],
+      ]);
     });
 
-    test('channel 15, pressure 0', () {
-      final bytes = Uint8List.fromList([0xD0 | 15, 0]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isAftertouch, isTrue);
-      expect(msg.channel, 15);
-    });
-
-    test('channel 8, pressure 127', () {
-      final bytes = Uint8List.fromList([0xD8, 127]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isAftertouch, isTrue);
-      expect(msg.channel, 8);
-      expect(msg.note, 127);
+    test('splits a 14-bit bank across MSB and LSB', () {
+      final messages =
+          MidiMessageBuilder.bankSelect(channel: 0, bank: 16383, program: 0);
+      expect(messages.first, [0xB0, 0, 127]);
+      expect(messages[1], [0xB0, 32, 127]);
     });
   });
 
-  group('Polyphonic Aftertouch byte construction', () {
-    test('channel 0, note 60, pressure 80', () {
-      final bytes = Uint8List.fromList([0xA0 | 0, 60 & 0x7F, 80 & 0x7F]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPolyAftertouch, isTrue);
-      expect(msg.isAftertouch, isFalse);
-      expect(msg.channel, 0);
-      expect(msg.note, 60);
-      expect(msg.velocity, 80); // pressure is in byte 2
+  group('RPN / NRPN', () {
+    test('RPN selects with CC 101/100, NRPN with CC 99/98', () {
+      // Regression: swapping the two selector pairs addresses a completely
+      // different parameter space — an RPN pitch-bend-range change would land
+      // on an unrelated device-specific NRPN.
+      final rpn = MidiMessageBuilder.parameterNumber(
+          channel: 0, parameter: 0, value: 2, registered: true);
+      final nrpn = MidiMessageBuilder.parameterNumber(
+          channel: 0, parameter: 0, value: 2, registered: false);
+      expect(rpn.first[1], 101);
+      expect(rpn[1][1], 100);
+      expect(nrpn.first[1], 99);
+      expect(nrpn[1][1], 98);
     });
 
-    test('channel 15, note 127, pressure 127', () {
-      final bytes = Uint8List.fromList([0xAF, 127, 127]);
-      final msg = MidiMessage(bytes);
-      expect(msg.isPolyAftertouch, isTrue);
-      expect(msg.channel, 15);
-      expect(msg.note, 127);
-      expect(msg.velocity, 127);
+    test('14-bit value sends CC 6 (MSB) before CC 38 (LSB), then deselects', () {
+      // Regression: CC 38 before CC 6 makes the receiver apply the LSB to the
+      // previous parameter value; dropping the deselect leaves the parameter
+      // selected so a later stray CC 6 retargets it.
+      final messages = MidiMessageBuilder.parameterNumber(
+        channel: 2,
+        parameter: 129,
+        value: 8193,
+        registered: true,
+      );
+      expect(messages, [
+        [0xB2, 101, 1], // parameter MSB
+        [0xB2, 100, 1], // parameter LSB
+        [0xB2, 6, 64], // value MSB
+        [0xB2, 38, 1], // value LSB
+        [0xB2, 101, 127], // deselect
+        [0xB2, 100, 127],
+      ]);
+    });
+
+    test('7-bit value sends CC 6 only', () {
+      final messages = MidiMessageBuilder.parameterNumber(
+        channel: 0,
+        parameter: 0,
+        value: 2,
+        registered: true,
+        fourteenBit: false,
+      );
+      expect(messages.map((m) => m[1]), [101, 100, 6, 101, 100]);
+      expect(messages[2], [0xB0, 6, 2]);
+    });
+
+    test('deselect: false omits the trailing 127/127 pair', () {
+      final messages = MidiMessageBuilder.parameterNumber(
+        channel: 0,
+        parameter: 0,
+        value: 2,
+        registered: false,
+        fourteenBit: false,
+        deselect: false,
+      );
+      expect(messages.map((m) => m[1]), [99, 98, 6]);
+    });
+
+    test('increment uses CC 96, decrement uses CC 97', () {
+      // Regression: swapping these inverts every relative parameter change.
+      final increment = MidiMessageBuilder.parameterNumberRelative(
+        channel: 3,
+        parameter: 129,
+        registered: true,
+        increment: true,
+        amount: 2,
+        deselect: false,
+      );
+      final decrement = MidiMessageBuilder.parameterNumberRelative(
+        channel: 3,
+        parameter: 129,
+        registered: true,
+        increment: false,
+        amount: 2,
+        deselect: false,
+      );
+      expect(increment.last, [0xB3, 96, 2]);
+      expect(decrement.last, [0xB3, 97, 2]);
     });
   });
 
-  group('Bank Select byte construction', () {
-    test('bank 0, program 0 produces correct CC sequence', () {
-      const bank = 0;
-      const program = 0;
-      final msb = (bank >> 7) & 0x7F;
-      final lsb = bank & 0x7F;
-
-      // CC 0 (Bank MSB)
-      final cc0 = MidiMessage(Uint8List.fromList([0xB0, 0, msb]));
-      expect(cc0.isControlChange, isTrue);
-      expect(cc0.controller, 0);
-      expect(cc0.value, 0);
-
-      // CC 32 (Bank LSB)
-      final cc32 = MidiMessage(Uint8List.fromList([0xB0, 32, lsb]));
-      expect(cc32.isControlChange, isTrue);
-      expect(cc32.controller, 32);
-      expect(cc32.value, 0);
-
-      // Program Change
-      final pc = MidiMessage(Uint8List.fromList([0xC0, program]));
-      expect(pc.isProgramChange, isTrue);
+  group('range validation', () {
+    test('rejects out-of-range arguments instead of truncating them', () {
+      // Regression: masking instead of throwing silently retargets the message
+      // — channel 16 would wrap to channel 0 and note 128 to note 0.
+      expect(() => MidiMessageBuilder.noteOn(channel: 16, note: 0, velocity: 0),
+          throwsRangeError);
+      expect(() => MidiMessageBuilder.noteOn(channel: 0, note: 128, velocity: 0),
+          throwsRangeError);
+      expect(
+          () => MidiMessageBuilder.controlChange(
+              channel: 0, controller: 0, value: 128),
+          throwsRangeError);
+      expect(() => MidiMessageBuilder.pitchBend(channel: 0, value: 16384),
+          throwsRangeError);
     });
 
-    test('bank 16383 (max) splits correctly into MSB/LSB', () {
-      const bank = 16383;
-      final msb = (bank >> 7) & 0x7F;
-      final lsb = bank & 0x7F;
-      expect(msb, 127);
-      expect(lsb, 127);
-
-      final cc0 = MidiMessage(Uint8List.fromList([0xB0, 0, msb]));
-      expect(cc0.value, 127);
-
-      final cc32 = MidiMessage(Uint8List.fromList([0xB0, 32, lsb]));
-      expect(cc32.value, 127);
-    });
-
-    test('bank 128 has MSB=1, LSB=0', () {
-      const bank = 128;
-      final msb = (bank >> 7) & 0x7F;
-      final lsb = bank & 0x7F;
-      expect(msb, 1);
-      expect(lsb, 0);
-    });
-
-    test('bank 129 has MSB=1, LSB=1', () {
-      const bank = 129;
-      final msb = (bank >> 7) & 0x7F;
-      final lsb = bank & 0x7F;
-      expect(msb, 1);
-      expect(lsb, 1);
-    });
-  });
-
-  group('RPN byte construction', () {
-    test('14-bit RPN sequence with deselect', () {
-      const channel = 2;
-      const parameter = 129;
-      const value = 8193;
-      final parameterMsb = (parameter >> 7) & 0x7F;
-      final parameterLsb = parameter & 0x7F;
-      final valueMsb = (value >> 7) & 0x7F;
-      final valueLsb = value & 0x7F;
-
-      final sequence = [
-        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 6, valueMsb]),
-        Uint8List.fromList([0xB0 | channel, 38, valueLsb]),
-        Uint8List.fromList([0xB0 | channel, 101, 127]),
-        Uint8List.fromList([0xB0 | channel, 100, 127]),
-      ];
-
-      expect(parameterMsb, 1);
-      expect(parameterLsb, 1);
-      expect(valueMsb, 64);
-      expect(valueLsb, 1);
-      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
-        101,
-        100,
-        6,
-        38,
-        101,
-        100,
-      ]);
-      expect(sequence.map((bytes) => MidiMessage(bytes).value), [
-        1,
-        1,
-        64,
-        1,
-        127,
-        127,
-      ]);
-    });
-
-    test('7-bit RPN sequence without deselect', () {
-      const parameter = 0;
-      const value = 2;
-
-      final sequence = [
-        Uint8List.fromList([0xB0, 101, (parameter >> 7) & 0x7F]),
-        Uint8List.fromList([0xB0, 100, parameter & 0x7F]),
-        Uint8List.fromList([0xB0, 6, value]),
-      ];
-
-      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
-        101,
-        100,
-        6,
-      ]);
-      expect(sequence.map((bytes) => MidiMessage(bytes).value), [0, 0, 2]);
-    });
-
-    test('RPN max 14-bit parameter and value split to 127/127', () {
-      const parameter = 16383;
-      const value = 16383;
-      expect((parameter >> 7) & 0x7F, 127);
-      expect(parameter & 0x7F, 127);
-      expect((value >> 7) & 0x7F, 127);
-      expect(value & 0x7F, 127);
-    });
-
-    test('RPN increment and decrement use CC 96/97', () {
-      const channel = 3;
-      const parameter = 129;
-      const amount = 1;
-      final parameterMsb = (parameter >> 7) & 0x7F;
-      final parameterLsb = parameter & 0x7F;
-
-      final incrementSequence = [
-        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 96, amount]),
-      ];
-      final decrementSequence = [
-        Uint8List.fromList([0xB0 | channel, 101, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 100, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 97, amount]),
-      ];
-
-      expect(incrementSequence.map((bytes) => MidiMessage(bytes).controller), [
-        101,
-        100,
-        96,
-      ]);
-      expect(decrementSequence.map((bytes) => MidiMessage(bytes).controller), [
-        101,
-        100,
-        97,
-      ]);
-    });
-  });
-
-  group('NRPN byte construction', () {
-    test('14-bit NRPN sequence with deselect', () {
-      const channel = 15;
-      const parameter = 1234;
-      const value = 256;
-      final parameterMsb = (parameter >> 7) & 0x7F;
-      final parameterLsb = parameter & 0x7F;
-      final valueMsb = (value >> 7) & 0x7F;
-      final valueLsb = value & 0x7F;
-
-      final sequence = [
-        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 6, valueMsb]),
-        Uint8List.fromList([0xB0 | channel, 38, valueLsb]),
-        Uint8List.fromList([0xB0 | channel, 99, 127]),
-        Uint8List.fromList([0xB0 | channel, 98, 127]),
-      ];
-
-      expect(parameterMsb, 9);
-      expect(parameterLsb, 82);
-      expect(valueMsb, 2);
-      expect(valueLsb, 0);
-      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
-        99,
-        98,
-        6,
-        38,
-        99,
-        98,
-      ]);
-      expect(sequence.map((bytes) => MidiMessage(bytes).value), [
-        9,
-        82,
-        2,
-        0,
-        127,
-        127,
-      ]);
-      expect(sequence.every((bytes) => MidiMessage(bytes).channel == channel),
-          isTrue);
-    });
-
-    test('7-bit NRPN sequence without deselect', () {
-      const parameter = 128;
-      const value = 127;
-
-      final sequence = [
-        Uint8List.fromList([0xB0, 99, (parameter >> 7) & 0x7F]),
-        Uint8List.fromList([0xB0, 98, parameter & 0x7F]),
-        Uint8List.fromList([0xB0, 6, value]),
-      ];
-
-      expect(sequence.map((bytes) => MidiMessage(bytes).controller), [
-        99,
-        98,
-        6,
-      ]);
-      expect(sequence.map((bytes) => MidiMessage(bytes).value), [1, 0, 127]);
-    });
-
-    test('NRPN increment and decrement use CC 96/97', () {
-      const channel = 4;
-      const parameter = 1234;
-      const amount = 2;
-      final parameterMsb = (parameter >> 7) & 0x7F;
-      final parameterLsb = parameter & 0x7F;
-
-      final incrementSequence = [
-        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 96, amount]),
-      ];
-      final decrementSequence = [
-        Uint8List.fromList([0xB0 | channel, 99, parameterMsb]),
-        Uint8List.fromList([0xB0 | channel, 98, parameterLsb]),
-        Uint8List.fromList([0xB0 | channel, 97, amount]),
-      ];
-
-      expect(incrementSequence.map((bytes) => MidiMessage(bytes).controller), [
-        99,
-        98,
-        96,
-      ]);
-      expect(decrementSequence.map((bytes) => MidiMessage(bytes).controller), [
-        99,
-        98,
-        97,
-      ]);
-      expect(incrementSequence.map((bytes) => MidiMessage(bytes).value), [
-        9,
-        82,
-        2,
-      ]);
-    });
-  });
-
-  group('Message type mutual exclusivity', () {
-    test('each message type is exclusively identified', () {
-      final messages = <String, MidiMessage>{
-        'NoteOn': MidiMessage(Uint8List.fromList([0x90, 60, 100])),
-        'NoteOff': MidiMessage(Uint8List.fromList([0x80, 60, 64])),
-        'CC': MidiMessage(Uint8List.fromList([0xB0, 7, 100])),
-        'PC': MidiMessage(Uint8List.fromList([0xC0, 5])),
-        'PitchBend': MidiMessage(Uint8List.fromList([0xE0, 0, 64])),
-        'SysEx': MidiMessage(Uint8List.fromList([0xF0, 0x7E, 0xF7])),
-        'Aftertouch': MidiMessage(Uint8List.fromList([0xD0, 100])),
-        'PolyAftertouch': MidiMessage(Uint8List.fromList([0xA0, 60, 80])),
-      };
-
-      for (final entry in messages.entries) {
-        final name = entry.key;
-        final msg = entry.value;
-
-        expect(
-          msg.isNoteOn,
-          name == 'NoteOn',
-          reason: '$name.isNoteOn',
-        );
-        // NoteOff is special: both 0x80 and 0x90-vel-0 are NoteOff
-        expect(
-          msg.isNoteOff,
-          name == 'NoteOff',
-          reason: '$name.isNoteOff',
-        );
-        expect(
-          msg.isControlChange,
-          name == 'CC',
-          reason: '$name.isControlChange',
-        );
-        expect(
-          msg.isProgramChange,
-          name == 'PC',
-          reason: '$name.isProgramChange',
-        );
-        expect(
-          msg.isPitchBend,
-          name == 'PitchBend',
-          reason: '$name.isPitchBend',
-        );
-        expect(
-          msg.isSysEx,
-          name == 'SysEx',
-          reason: '$name.isSysEx',
-        );
-        expect(
-          msg.isAftertouch,
-          name == 'Aftertouch',
-          reason: '$name.isAftertouch',
-        );
-        expect(
-          msg.isPolyAftertouch,
-          name == 'PolyAftertouch',
-          reason: '$name.isPolyAftertouch',
-        );
-      }
+    test('7-bit parameter values are capped at 127, 14-bit ones at 16383', () {
+      expect(
+          () => MidiMessageBuilder.parameterNumber(
+              channel: 0,
+              parameter: 0,
+              value: 128,
+              registered: true,
+              fourteenBit: false),
+          throwsRangeError);
+      expect(
+          MidiMessageBuilder.parameterNumber(
+              channel: 0,
+              parameter: 0,
+              value: 128,
+              registered: true,
+              fourteenBit: true),
+          isNotEmpty);
+      expect(
+          () => MidiMessageBuilder.parameterNumber(
+              channel: 0,
+              parameter: 0,
+              value: 16384,
+              registered: true,
+              fourteenBit: true),
+          throwsRangeError);
     });
   });
 }

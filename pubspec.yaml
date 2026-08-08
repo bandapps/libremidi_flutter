@@ -1,16 +1,18 @@
 name: libremidi_flutter
 description: "Cross-platform MIDI device access for Flutter. Supports macOS, iOS, Android, Windows, and Linux with hotplug detection."
-version: 0.8.5
+version: 0.8.6
 repository: https://github.com/bandapps/libremidi_flutter
 issue_tracker: https://github.com/bandapps/libremidi_flutter/issues
 topics:
   - midi
   - audio
   - music
-  - ffi
+  - sequencer
 
 environment:
-  sdk: ^3.1.0
+  # ffi ^2.2.0 declares sdk '>=3.7.0 <4.0.0', so ^3.1.0 was never actually
+  # resolvable — a consumer on Dart 3.1 could not get a matching ffi.
+  sdk: ^3.7.0
   flutter: '>=3.10.0'
 
 dependencies:
@@ -19,7 +21,7 @@ dependencies:
   ffi: ^2.2.0
 
 dev_dependencies:
-  ffigen: ^20.1.1
+  ffigen: ^21.0.0
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0

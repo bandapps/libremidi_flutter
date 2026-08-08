@@ -1,0 +1,5 @@
+# Built harness binaries and debug symbols
+stress_asan
+stress_tsan
+stress_plain
+*.dSYM/

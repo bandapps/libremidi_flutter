@@ -1,4 +1,17 @@
-# libremidi files not needed at runtime
+# NOTE: .pubignore REPLACES .gitignore for `pub publish` — its rules are not
+# merged with .gitignore's. Every exclusion that matters for the published
+# archive has to be repeated here. Patterns follow .gitignore syntax, so a
+# leading / anchors to the package root and a bare name matches at any depth.
+
+# Internal project notes — untracked but not ignored, so they end up in the
+# archive unless listed here.
+CLAUDE.md
+
+# Development-only tooling (macOS stress harness). Useful in the repo, not
+# something consumers should download.
+/tool/
+
+# libremidi sources not needed at runtime
 third_party/libremidi/tests/
 third_party/libremidi/examples/
 third_party/libremidi/book/
@@ -15,5 +28,27 @@ third_party/libremidi/.gitignore
 *.dylib
 *.dll
 build/
+# ...except the bundled WinMIDI SDK, which ships its headers under a directory
+# literally named build/. In 0.8.5 the unanchored `build/` above swallowed them
+# (verified in the published archive), so src/CMakeLists.txt found no
+# winmidi/ include dir at consumers and silently fell back to WinUWP.
+# One negation per level is required: a pattern cannot re-include anything
+# whose parent directory is still excluded.
+!third_party/winmidi_sdk/build/
+!third_party/winmidi_sdk/build/native/
+!third_party/winmidi_sdk/build/native/include/
+!third_party/winmidi_sdk/build/native/include/winmidi/
+!third_party/winmidi_sdk/build/native/include/winmidi/**
+
+# SwiftPM local state: .build holds a ~19 MB index store per platform, .swiftpm
+# holds per-user Xcode scheme data. Both are in .gitignore, which does not
+# apply here.
+.build/
+.swiftpm/
+
+# Tooling state
 .dart_tool/
 .packages
+.idea/
+*.iml
+.DS_Store

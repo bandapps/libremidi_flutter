@@ -40,10 +40,10 @@ public:
 
   stdx::error open_port(const input_port& port, std::string_view /*name*/) override
   {
-    if (is_port_open())
+    if (port_requested)
     {
       libremidi_handle_error(configuration, "midi_in::open_port: a port is already open");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
     const unsigned int port_number = port.port;
@@ -51,34 +51,54 @@ public:
     if (!env)
     {
       libremidi_handle_error(configuration, "midi_in::open_port: failed to get JNI environment");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
     auto ctx = context::get_context(env);
     if (!ctx)
     {
       libremidi_handle_error(configuration, "midi_in::open_port: failed to get Android context");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
+    // The index below refers to the list this refresh produces, so both must
+    // happen under one lock.
+    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
     context::refresh_midi_devices(env, ctx, false);
 
     if (port_number >= context::midi_ports.size())
     {
       libremidi_handle_error(configuration, "midi_in::open_port: invalid port number");
-      return std::errc{};
+      return std::errc::io_error;
     }
 
-    port_open = true;
+    port_requested = true;
     running = true;
-    context::open_device(context::midi_ports[port_number], this, false);
+    // Hand Java a token, not `this`: the open completes asynchronously and this
+    // object may be gone by then. The token also carries the port index, so a
+    // second open cannot redirect this one to a different port.
+    const auto& entry = context::midi_ports[port_number];
+    const int64_t token = register_pending_open(this, entry.port_index, false);
+    if (!context::open_device(entry, token, false))
+    {
+      // Nothing was handed to Java, so no callback will arrive to clear this.
+      running = false;
+      port_requested = false;
+      libremidi_handle_error(configuration, "midi_in::open_port: openDevice failed");
+      return std::errc::io_error;
+    }
     return stdx::error{};
   }
 
   stdx::error close_port() override
   {
-    if (!is_port_open())
+    // Drop any open that has not called back yet, so a late callback resolves
+    // to nothing instead of writing into this object after it is destroyed.
+    cancel_pending_open(this);
+
+    if (!port_requested)
       return std::errc{};
+    port_requested = false;
 
     running = false;
 
@@ -87,23 +107,34 @@ public:
       poll_thread.join();
     }
 
-    if (midi_output_port)
+    if (auto* port = midi_output_port.exchange(nullptr, std::memory_order_acq_rel))
     {
-      AMidiOutputPort_close(midi_output_port);
-      midi_output_port = nullptr;
+      AMidiOutputPort_close(port);
     }
 
-    if (receive_device)
+    if (auto* device = receive_device.exchange(nullptr, std::memory_order_acq_rel))
     {
-      AMidiDevice_release(receive_device);
-      receive_device = nullptr;
+      AMidiDevice_release(device);
     }
 
-    port_open = false;
     return stdx::error{};
   }
 
-  bool is_port_open() const noexcept { return port_open; }
+  // Reports the *actual* state, not the request. Opening is asynchronous on
+  // Android: open_port() returns before MidiManager has handed the device
+  // back, so a caller that trusted an optimistic flag saw "open" while a send
+  // still failed with "port is not open".
+  bool is_port_open() const noexcept
+  {
+    return midi_output_port.load(std::memory_order_acquire) != nullptr;
+  }
+
+  // Clears the requested state when no callback will ever arrive.
+  static void open_failed(midi_in* self) noexcept
+  {
+    self->running = false;
+    self->port_requested = false;
+  }
 
   void start_midi_thread() { poll_thread = std::thread(&midi_in::poll_midi, this); }
 
@@ -116,6 +147,12 @@ public:
         .has_samples = false,
     };
 
+    // The poll thread starts only after the port was stored, and close_port()
+    // joins this thread before clearing it, so one load is enough.
+    AMidiOutputPort* const port = midi_output_port.load(std::memory_order_acquire);
+    if (!port)
+      return;
+
     uint8_t buffer[1024];
     int32_t op_code;
     int64_t timestamp;
@@ -126,7 +163,7 @@ public:
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
       ssize_t num_messages = AMidiOutputPort_receive(
-          midi_output_port, &op_code, buffer, sizeof(buffer), &num_bytes, &timestamp);
+          port, &op_code, buffer, sizeof(buffer), &num_bytes, &timestamp);
 
       if (num_messages < 0)
       {
@@ -145,19 +182,37 @@ public:
     }
   }
 
-  static void open_callback(midi_in* self, AMidiDevice* device)
+  static void open_callback(midi_in* self, AMidiDevice* device, int port_index)
   {
-    self->receive_device = device;
-    AMidiOutputPort_open(device, context::pending_port_index, &self->midi_output_port);
+    // Check the result: on failure starting the poll thread would spin
+    // AMidiOutputPort_receive() on a null port forever, while the API reported
+    // the input as open.
+    AMidiOutputPort* port = nullptr;
+    if (AMidiOutputPort_open(device, port_index, &port) != AMEDIA_OK)
+    {
+      LOGE("AMidiOutputPort_open failed for port %d", port_index);
+      // Release the device here: close_port() bails out early once the request
+      // is cleared, so it would never get to AMidiDevice_release().
+      AMidiDevice_release(device);
+      open_failed(self);
+      return;
+    }
+    // Publish both before the poll thread can observe them.
+    self->receive_device.store(device, std::memory_order_release);
+    self->midi_output_port.store(port, std::memory_order_release);
     self->start_midi_thread();
   }
 
 private:
   libremidi::input_configuration configuration;
-  AMidiDevice* receive_device = nullptr;
-  AMidiOutputPort* midi_output_port = nullptr;
+  // Touched by three threads: the Java open callback stores them, the poll
+  // thread reads the port, and the caller clears both in close_port(). Plain
+  // pointers here were a data race, and is_port_open()/send paths made it a
+  // read from yet another thread.
+  std::atomic<AMidiDevice*> receive_device{nullptr};
+  std::atomic<AMidiOutputPort*> midi_output_port{nullptr};
   std::thread poll_thread;
-  std::atomic<bool> port_open{false};
+  std::atomic<bool> port_requested{false};
   std::atomic<bool> running{false};
   midi1::input_state_machine m_processing{this->configuration};
 };

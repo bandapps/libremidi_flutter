@@ -85,4 +85,30 @@ void main() {
             '(^$readmeVersion) != pubspec ($pubspecVersion) — '
             'update the `dependencies:` example when bumping the version.');
   });
+
+  test('CHANGELOG has an entry for the current version', () {
+    final pubspecVersion = RegExp(r'^version:\s*([0-9]+\.[0-9]+\.[0-9]+)',
+            multiLine: true)
+        .firstMatch(readFromRoot('pubspec.yaml'))
+        ?.group(1);
+    expect(pubspecVersion, isNotNull,
+        reason: 'could not parse version from pubspec.yaml');
+
+    // Regression: bumping pubspec (and the native copies, which the test above
+    // pins) while forgetting the CHANGELOG stayed green and published a release
+    // whose notes describe the *previous* version. pub.dev shows this section
+    // verbatim on the package page.
+    final headings = RegExp(r'^##\s+\[?([0-9]+\.[0-9]+\.[0-9]+)',
+            multiLine: true)
+        .allMatches(readFromRoot('CHANGELOG.md'))
+        .map((m) => m.group(1)!)
+        .toList();
+
+    expect(headings, contains(pubspecVersion),
+        reason: 'CHANGELOG.md has no "## $pubspecVersion" section — add the '
+            'release notes for this version. Found: $headings');
+    expect(headings.first, pubspecVersion,
+        reason: 'CHANGELOG.md lists ${headings.first} first but pubspec is at '
+            '$pubspecVersion — the newest release belongs at the top.');
+  });
 }

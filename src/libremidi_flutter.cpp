@@ -1,7 +1,7 @@
 #include "libremidi_flutter.h"
 
 // Library version
-#define LRM_VERSION "0.8.5"
+#define LRM_VERSION "0.8.6"
 
 // Enable header-only mode
 #define LIBREMIDI_HEADER_ONLY 1
@@ -24,11 +24,15 @@
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <algorithm>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -63,33 +67,88 @@ static constexpr const char* kInternalClientName = "libremidi_flutter_internal";
 #define LRM_EVENT_OUTPUT_ADDED   2
 #define LRM_EVENT_OUTPUT_REMOVED 3
 
-// FNV-1a 64-bit hash for stable_id / public port id generation
+// FNV-1a 64-bit hash for stable_id / public port id generation.
+// Iterates over unsigned char: plain `char` is signed on x86/arm64 but unsigned
+// on some ABIs, so a byte >= 0x80 (any non-ASCII port name) would sign-extend
+// to a different 64-bit value per platform and break the "cross-platform stable
+// id" promise. Must stay identical to the copy in apple/Classes/libremidi_flutter.cpp.
 static uint64_t fnv1a_hash(const std::string& str) {
     uint64_t hash = 14695981039346656037ULL; // FNV offset basis
-    for (char c : str) {
+    for (unsigned char c : str) {
         hash ^= static_cast<uint64_t>(c);
         hash *= 1099511628211ULL; // FNV prime
     }
     return hash;
 }
 
+// Generate stable port key for cross-platform identification
+template<typename PortType>
+static std::string port_key(const PortType& port) {
+    return port.port_name + "|" + port.manufacturer + "|" + port.product + "|" + port.serial;
+}
+
 template<typename PortType>
 static uint64_t public_port_id(const PortType& port) {
-    // WinRT and WinMIDI ports use string-based device IDs, not numeric.
-    // Hash port_name for a stable uint64_t identifier across the FFI boundary.
-    if (port.api == libremidi::API::WINDOWS_UWP
-        || port.api == libremidi::API::WINDOWS_MIDI_SERVICES) {
+    // Windows MIDI Services: port.port is only the group terminal block number
+    // (1-based, repeats across endpoints) and port_name is that block's display
+    // name — two identical devices therefore collide, and open_by_id would
+    // always hit the first one. The unique part is the endpoint device id
+    // (port_information.hpp: "WinMIDI: EndpointDeviceId (std::string)"), and
+    // libremidi's own open_port() identifies a port by exactly the pair
+    // (device id, port.port) — so hash that pair.
+    if (port.api == libremidi::API::WINDOWS_MIDI_SERVICES) {
+        const auto suffix = "|" + std::to_string(static_cast<uint64_t>(port.port));
+        if (const auto* device_id
+                = libremidi_variant_alias::get_if<std::string>(&port.device)) {
+            return fnv1a_hash(*device_id + suffix);
+        }
+        // No endpoint id available — still better than a bare name collision.
+        return fnv1a_hash(port.port_name + suffix);
+    }
+
+    // WinUWP: port.port is always 0, but port_name carries the unique device id
+    // (winuwp/observer.hpp sets .port_name = portId), so hashing it is correct.
+    if (port.api == libremidi::API::WINDOWS_UWP) {
         return fnv1a_hash(port.port_name);
+    }
+
+    // Android: port.port is the index into the current enumeration
+    // (android/observer.hpp sets .port = i), so it changes whenever a device
+    // is added or removed — a saved id would silently start addressing a
+    // different device, which is exactly what MidiPort.portId promises not to
+    // do. Hash the identifying strings instead. Android exposes no per-device
+    // unique id here, so two indistinguishable devices (same name and
+    // manufacturer, no serial) still collide; that is a limitation of the
+    // platform data, not of the encoding.
+    if (port.api == libremidi::API::ANDROID_AMIDI) {
+        return fnv1a_hash(port_key(port));
     }
 
     return static_cast<uint64_t>(port.port);
 }
 
+// Serialises "resolve a port, then open it" against the Android enumeration
+// cache, and is an empty struct everywhere else.
+//
+// Android identifies a port by its position in that cache, so a port object
+// resolved from one enumeration is only meaningful until the next one. Without
+// this, a device appearing or disappearing between resolving an id and calling
+// open_port() made the index address a different device — the API would report
+// the requested port open while another one actually was.
+struct AndroidPortCacheLock {
+#if defined(__ANDROID__)
+    std::lock_guard<std::recursive_mutex> lock{
+        libremidi::android::context::ports_mutex()};
+#endif
+};
+
 struct LrmObserver {
     std::unique_ptr<libremidi::observer> observer;
     std::vector<libremidi::input_port> input_ports;
     std::vector<libremidi::output_port> output_ports;
-    LrmHotplugCallback hotplug_callback;
+    // Written by the destructor on the caller's thread, read by the backend's
+    // hotplug thread in notifyHotplug — atomic so teardown is not a data race.
+    std::atomic<LrmHotplugCallback> hotplug_callback;
     void* hotplug_context;
     mutable std::mutex ports_mutex;  // Thread safety for port vectors
 
@@ -132,7 +191,18 @@ struct LrmObserver {
         refreshInternal();
     }
 
-    ~LrmObserver() = default;
+    ~LrmObserver() {
+        // Explicit teardown order. With the defaulted destructor, members were
+        // destroyed in reverse declaration order — ports_mutex and the port
+        // vectors went away *before* `observer`, which is declared first. The
+        // backend's hotplug thread can still be inside one of the configuration
+        // callbacks installed in the constructor at that moment, and those call
+        // refreshInternal(), i.e. they lock ports_mutex and assign the vectors.
+        // Destroying the observer first unregisters those callbacks and stops
+        // the backend thread while everything they touch is still alive.
+        hotplug_callback.store(nullptr, std::memory_order_release);
+        observer.reset();
+    }
 
     template <typename PortType>
     static bool isInternalObserverPort(const PortType& port) {
@@ -235,17 +305,82 @@ struct LrmObserver {
     }
 
     void notifyHotplug(int eventType) {
-        if (hotplug_callback) {
-            hotplug_callback(hotplug_context, eventType);
+        if (auto cb = hotplug_callback.load(std::memory_order_acquire)) {
+            cb(hotplug_context, eventType);
         }
     }
 };
 
 
+// Ownership of the message buffers handed to Dart.
+//
+// Each incoming message is copied to the heap and released again by the Dart
+// listener through lrm_free. Invocations still queued when
+// NativeCallable.close() runs are discarded by the Dart runtime, so their
+// copies never reached lrm_free and leaked — bounded by what was in flight at
+// dispose, which for large SysEx is not nothing.
+//
+// Tracking the buffers here fixes that: the input reclaims whatever is still
+// outstanding when it closes, and lrm_free ignores a pointer that has already
+// been reclaimed, so a late Dart call cannot double free.
+namespace {
+std::mutex& message_buffers_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<void*, const void*>& message_buffers() {
+    static std::unordered_map<void*, const void*> m;
+    return m;
+}
+}
+
+// Allocates a message buffer owned by `owner` until Dart frees it or the owner
+// goes away.
+static uint8_t* claim_message_buffer(size_t size, const void* owner) {
+    auto* buffer = static_cast<uint8_t*>(std::malloc(size));
+    if (!buffer)
+        return nullptr;
+    std::lock_guard<std::mutex> lock(message_buffers_mutex());
+    message_buffers()[buffer] = owner;
+    return buffer;
+}
+
+// Frees every buffer still outstanding for `owner`.
+static void release_message_buffers_of(const void* owner) {
+    std::vector<void*> orphans;
+    {
+        std::lock_guard<std::mutex> lock(message_buffers_mutex());
+        auto& map = message_buffers();
+        for (auto it = map.begin(); it != map.end();) {
+            if (it->second == owner) {
+                orphans.push_back(it->first);
+                it = map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto* buffer : orphans)
+        std::free(buffer);
+}
+
 struct LrmMidiIn {
     std::unique_ptr<libremidi::midi_in> midi_in;
     LrmMidiCallback callback;
     void* context;
+
+    // Drains the message callback before libremidi is torn down. The backends
+    // differ in what they guarantee at destruction: the ALSA sequencer backend
+    // stops its own polling thread in close_port(), but CoreMIDI's teardown is
+    // ~midi_in_core -> close_port() -> MIDIPortDispose(), and MIDIPortDispose
+    // does not promise that a MIDIReadProc already running on CoreMIDI's thread
+    // has returned. Rather than depend per backend on an undocumented promise,
+    // guard our own callback: without it, closing an input under dense traffic
+    // can run the lambda below against members that are already being
+    // destroyed. Must stay in sync with apple/Classes/libremidi_flutter.cpp.
+    std::mutex callback_mutex;
+    bool closing = false;
 
     LrmMidiIn(libremidi::input_port port, LrmMidiCallback cb, void* ctx,
               bool receive_sysex, bool receive_timing, bool receive_sensing)
@@ -256,7 +391,8 @@ struct LrmMidiIn {
         config.ignore_timing = !receive_timing;
         config.ignore_sensing = !receive_sensing;
         config.on_message = [this](const libremidi::message& msg) {
-            if (!callback)
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            if (closing || !callback)
                 return;
             const size_t size = msg.bytes.size();
             if (size == 0)
@@ -267,7 +403,7 @@ struct LrmMidiIn {
             // NativeCallable.listener that reads the bytes later on the event
             // loop, so hand it an owning heap copy and let it release the copy
             // via lrm_free once it has been read.
-            auto* copy = static_cast<uint8_t*>(std::malloc(size));
+            auto* copy = claim_message_buffer(size, this);
             if (!copy)
                 return;
             std::memcpy(copy, msg.bytes.data(), size);
@@ -283,7 +419,29 @@ struct LrmMidiIn {
             std::move(config),
             std::move(api_conf)
         );
-        midi_in->open_port(port);
+        // Propagate a failed open. libremidi reports it as a return value, not
+        // an exception; ignoring it handed Dart a live LrmMidiIn* for a port
+        // that was never opened, so every later call silently did nothing.
+        // The lrm_midi_in_open* wrappers turn this into a nullptr result.
+        if (auto err = midi_in->open_port(port); err != stdx::error{}) {
+            throw std::runtime_error("open_port failed");
+        }
+    }
+
+    ~LrmMidiIn() {
+        // Reject further deliveries, wait for one that is already inside the
+        // callback, and only then let libremidi close the port. A delivery that
+        // *starts* during libremidi's own teardown still dereferences
+        // libremidi's object before reaching our lambda — that part cannot be
+        // fixed from here.
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            closing = true;
+        }
+        midi_in.reset();
+        // Nothing can deliver any more, so anything still outstanding will
+        // never come back through lrm_free. Reclaim it.
+        release_message_buffers_of(this);
     }
 };
 
@@ -300,7 +458,10 @@ struct LrmMidiOut {
             libremidi::output_configuration{},
             std::move(api_conf)
         );
-        midi_out->open_port(port);
+        // See LrmMidiIn: a failed open must not look like success.
+        if (auto err = midi_out->open_port(port); err != stdx::error{}) {
+            throw std::runtime_error("open_port failed");
+        }
     }
 };
 
@@ -312,9 +473,20 @@ extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
     return LRM_VERSION;
 }
 
-// Free a heap buffer handed to Dart by the input callback. Uses the library's
-// own allocator so the caller does not depend on a matching C runtime.
+// Free a heap buffer handed to Dart by the input callback. Ignores a pointer
+// that is not outstanding: the owning input may have reclaimed it already when
+// it closed, and the Dart listener can still be holding a stale copy of it.
 extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
+    if (!ptr)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(message_buffers_mutex());
+        auto& map = message_buffers();
+        auto it = map.find(ptr);
+        if (it == map.end())
+            return;
+        map.erase(it);
+    }
     std::free(ptr);
 }
 
@@ -345,6 +517,14 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_observer_free(LrmObserver* observer) {
     delete observer;
 }
 
+extern "C" FFI_PLUGIN_EXPORT bool lrm_observer_hotplug_available(LrmObserver* observer) {
+    if (!observer) return false;
+    // These backends register their hotplug callbacks with the libremidi
+    // observer itself, which throws on failure, so reaching this point with a
+    // callback installed means notifications can be delivered.
+    return observer->hotplug_callback.load(std::memory_order_acquire) != nullptr;
+}
+
 extern "C" FFI_PLUGIN_EXPORT void lrm_observer_refresh(LrmObserver* observer) {
     if (!observer) return;
     observer->refresh();
@@ -364,12 +544,6 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output_count(LrmObserver* 
 static void safe_strcpy(char* dest, size_t dest_size, const std::string& src) {
     std::strncpy(dest, src.c_str(), dest_size - 1);
     dest[dest_size - 1] = '\0';
-}
-
-// Generate stable port key for cross-platform identification
-template<typename PortType>
-static std::string port_key(const PortType& port) {
-    return port.port_name + "|" + port.manufacturer + "|" + port.product + "|" + port.serial;
 }
 
 // Helper to fill port info from libremidi port
@@ -473,6 +647,8 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer
     if (!observer) return nullptr;
     if (port_index < 0) return nullptr;
 
+    AndroidPortCacheLock cache_lock;
+
     libremidi::output_port port;
     if (!observer->getOutputPort(static_cast<size_t>(port_index), port)) {
         return nullptr;
@@ -487,6 +663,14 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer
 
 extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* observer, uint64_t port_id) {
     if (!observer) return nullptr;
+
+    // Hold the Android enumeration cache still for resolve-and-open, and
+    // re-enumerate first so the positional index inside the resolved port
+    // matches what open_port() will index into. No-ops elsewhere.
+    AndroidPortCacheLock cache_lock;
+#if defined(__ANDROID__)
+    observer->refresh();
+#endif
 
     libremidi::output_port port;
     if (!observer->getOutputPortById(port_id, port)) {
@@ -513,7 +697,14 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_midi_out_send(LrmMidiOut* midi_out, con
     if (!midi_out || !midi_out->midi_out || !data) return LRM_ERR_INVALID;
 
     try {
-        midi_out->midi_out->send_message(data, length);
+        // send_message reports failure by return value. Only reporting thrown
+        // exceptions made this return LRM_OK for sends the backend rejected —
+        // most visibly on Android, where a send before the asynchronous device
+        // open completes fails at the backend but was reported as success.
+        if (auto err = midi_out->midi_out->send_message(data, length);
+            err != stdx::error{}) {
+            return LRM_ERR_SEND_FAILED;
+        }
         return LRM_OK;
     } catch (...) {
         return LRM_ERR_SEND_FAILED;
@@ -535,6 +726,8 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open(
 ) {
     if (!observer) return nullptr;
     if (port_index < 0) return nullptr;
+
+    AndroidPortCacheLock cache_lock;
 
     libremidi::input_port port;
     if (!observer->getInputPort(static_cast<size_t>(port_index), port)) {
@@ -559,6 +752,12 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
     bool receive_sensing
 ) {
     if (!observer) return nullptr;
+
+    // See lrm_midi_out_open_by_id.
+    AndroidPortCacheLock cache_lock;
+#if defined(__ANDROID__)
+    observer->refresh();
+#endif
 
     libremidi::input_port port;
     if (!observer->getInputPortById(port_id, port)) {

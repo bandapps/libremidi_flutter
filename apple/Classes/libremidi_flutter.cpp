@@ -13,10 +13,12 @@
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <memory>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -38,17 +40,27 @@
 #define LRM_EVENT_SETUP_CHANGED  4
 
 // Forward declaration
-struct LrmObserver;
+struct ObserverState;
 
 // Hotplug notifications use the classic run-loop based MIDIClientCreate, served
 // by a dedicated thread that owns a persistent CFRunLoop (see LrmObserver).
-static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification);
+static void handleMIDINotification(ObserverState* obs, const MIDINotification* notification);
 
-struct LrmObserver {
+struct ObserverState {
     std::unique_ptr<libremidi::observer> observer;
     std::vector<libremidi::input_port> input_ports;
     std::vector<libremidi::output_port> output_ports;
+    // Guarded by callback_mutex: requestStop() clears it and, by taking the
+    // same lock, waits out a delivery that is already running. That is what
+    // lets the caller close its NativeCallable and walk away while this thread
+    // is still stuck inside CoreMIDI.
     LrmHotplugCallback hotplug_callback;
+    mutable std::mutex callback_mutex;
+    // Whether this observer was created for hotplug. Fixed at construction:
+    // requestStop() clears hotplug_callback, and reading that pointer to decide
+    // *what kind of observer this is* would both race with it and change the
+    // answer halfway through initialisation.
+    const bool wants_hotplug;
     void* hotplug_context;
     mutable std::mutex ports_mutex;
 
@@ -65,14 +77,34 @@ struct LrmObserver {
     std::mutex runloop_mutex;
     std::condition_variable runloop_cv;
     bool runloop_ready;
+    // Signalled by the destructor to break the run loop. Guarded by
+    // runloop_mutex; the thread clears and releases it there too, so the
+    // destructor can never signal a source that is being released.
+    CFRunLoopSourceRef stopSource;
+    // Read by the MIDI thread outside the lock, hence atomic. This flag — not
+    // CFRunLoopStop — is what actually ends the loop.
+    std::atomic<bool> stop_requested;
+    // Result of MIDIClientCreate, or kPending until initInternal has run.
+    //
+    // It must NOT start at noErr: initialisation happens on the MIDI thread, so
+    // a caller asking right after construction would otherwise be told hotplug
+    // works before we have even tried. Pending reads as "not available yet",
+    // which is the safe answer — the caller is told to check again after the
+    // first setup_changed event, which is emitted immediately after this is
+    // set.
+    static constexpr OSStatus kPending = 1;  // no CoreMIDI status uses this
+    std::atomic<OSStatus> client_status{kPending};
 
-    LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
+    ObserverState(LrmHotplugCallback callback = nullptr, void* context = nullptr)
         : hotplug_callback(callback), hotplug_context(context)
+        , wants_hotplug(callback != nullptr)
         , midiClient(0)
         , midiRunLoop(nullptr)
         , runloop_ready(false)
+        , stopSource(nullptr)
+        , stop_requested(false)
     {
-        if (hotplug_callback) {
+        if (wants_hotplug) {
             // Hotplug (long-lived UI) path. On a real iOS device the first
             // CoreMIDI/midiserverd contact can block for minutes, and Dart
             // calls this constructor synchronously over FFI on the UI isolate
@@ -82,7 +114,9 @@ struct LrmObserver {
             // the UI, and (unlike a GCD queue) the run loop stays alive so
             // hotplug notifications keep being delivered. SETUP_CHANGED is
             // emitted once the initial port list is ready.
-            midiThread = std::thread([this] { midiThreadMain(); });
+            // Started by create(), which owns a shared_ptr it can hand to the
+            // thread. Starting it here would give the thread a bare `this` and
+            // reintroduce the lifetime problem this design removes.
         } else {
             // No-hotplug (one-shot query) path: kept synchronous so a
             // construct-then-read stays valid. The integration tests and any
@@ -100,14 +134,29 @@ struct LrmObserver {
 
         // Keep the run loop from returning immediately when it has no other
         // input source yet. This source does nothing; it just holds the loop.
-        CFRunLoopSourceContext srcCtx = {};
-        srcCtx.perform = [](void*) {};
-        CFRunLoopSourceRef keepAlive = CFRunLoopSourceCreate(nullptr, 0, &srcCtx);
+        CFRunLoopSourceContext keepAliveCtx = {};
+        keepAliveCtx.perform = [](void*) {};
+        CFRunLoopSourceRef keepAlive = CFRunLoopSourceCreate(nullptr, 0, &keepAliveCtx);
         CFRunLoopAddSource(midiRunLoop, keepAlive, kCFRunLoopCommonModes);
 
-        // Publish the run loop so the destructor can stop it safely.
+        // Source the destructor signals to break the loop. Signalling a source
+        // is order-independent: signalled before the loop runs, the signal
+        // stays pending and fires on the first pass.
+        CFRunLoopSourceContext stopCtx = {};
+        stopCtx.info = this;
+        stopCtx.perform = [](void* info) {
+            auto* self = static_cast<ObserverState*>(info);
+            if (self->stop_requested.load(std::memory_order_acquire)) {
+                CFRunLoopStop(CFRunLoopGetCurrent());
+            }
+        };
+        CFRunLoopSourceRef stop = CFRunLoopSourceCreate(nullptr, 0, &stopCtx);
+        CFRunLoopAddSource(midiRunLoop, stop, kCFRunLoopCommonModes);
+
+        // Publish the run loop and the stop source for the destructor.
         {
             std::lock_guard<std::mutex> lock(runloop_mutex);
+            stopSource = stop;
             runloop_ready = true;
         }
         runloop_cv.notify_all();
@@ -115,8 +164,32 @@ struct LrmObserver {
         initInternal();
         notifyHotplug(LRM_EVENT_SETUP_CHANGED);
 
-        // Process CoreMIDI notifications until the destructor calls CFRunLoopStop.
-        CFRunLoopRun();
+        // Service CoreMIDI notifications until a stop is requested.
+        //
+        // Two earlier attempts lost a stop that arrived before this loop was
+        // entered — first a bare CFRunLoopStop, then a CFRunLoopPerformBlock —
+        // after which the loop ran forever and the destructor's join() blocked
+        // the calling isolate permanently. Both relied on CoreFoundation
+        // holding on to a stop for a run loop that is not running yet, which it
+        // does not do reliably.
+        //
+        // What makes this correct is that a *signalled source* is state on the
+        // source itself and survives until the source is serviced, so the stop
+        // cannot be dropped no matter when it arrives:
+        //
+        //   - stop before the check below   -> the loop is never entered
+        //   - stop while the loop runs      -> the signalled source stops it
+        //   - stop between check and entry  -> the signal is already pending
+        //                                      and fires on the first pass
+        //
+        // No timeout is needed for this, and none is used: tool/stress verifies
+        // it. Under a hotplug storm with disposal jitter aimed at the window
+        // between initialisation and loop entry, this survives thousands of
+        // create/free cycles, while the CFRunLoopPerformBlock version hangs
+        // within seconds on the same run.
+        while (!stop_requested.load(std::memory_order_acquire)) {
+            CFRunLoopRun();
+        }
 
         // Tear down the CoreMIDI objects on the same thread that created them.
         if (midiClient) {
@@ -127,6 +200,19 @@ struct LrmObserver {
             std::lock_guard<std::mutex> lock(ports_mutex);
             observer.reset();
         }
+
+        // Take the stop source back under the lock before releasing it, so a
+        // destructor running right now cannot signal a released source.
+        CFRunLoopSourceRef stopToRelease = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(runloop_mutex);
+            stopToRelease = stopSource;
+            stopSource = nullptr;
+        }
+        if (stopToRelease) {
+            CFRunLoopRemoveSource(midiRunLoop, stopToRelease, kCFRunLoopCommonModes);
+            CFRelease(stopToRelease);
+        }
         CFRunLoopRemoveSource(midiRunLoop, keepAlive, kCFRunLoopCommonModes);
         CFRelease(keepAlive);
     }
@@ -136,19 +222,33 @@ struct LrmObserver {
     // Runs on the dedicated MIDI thread for the hotplug path, or synchronously
     // on the caller for the no-hotplug path.
     void initInternal() {
-        if (hotplug_callback) {
+        if (wants_hotplug) {
             // Classic, run-loop based MIDIClientCreate: notifications are
             // delivered on THIS thread's CFRunLoop, which midiThreadMain keeps
             // running for the observer's lifetime, so hotplug stays reliable.
             // On failure midiClient is left 0, which every other path tolerates.
-            MIDIClientCreate(
+            const OSStatus status = MIDIClientCreate(
                 CFSTR("libremidi_flutter"),
                 [](const MIDINotification* notification, void* refCon) {
-                    handleMIDINotification(static_cast<LrmObserver*>(refCon), notification);
+                    handleMIDINotification(static_cast<ObserverState*>(refCon), notification);
                 },
                 this,
                 &midiClient
             );
+            client_status.store(status, std::memory_order_release);
+            if (status != noErr) {
+                // No notification client: port enumeration below still works,
+                // so the port list and SETUP_CHANGED stay correct, but no
+                // hotplug notification will ever arrive for this observer.
+                // This happens for real — a CoreMIDI server that is not
+                // reachable returns kMIDINoConnection (-10833) here.
+                //
+                // Dart cannot currently tell this apart from a healthy
+                // observer: the C ABI has no channel to report it, and
+                // inventing one is an API change. lrm_observer_hotplug_status()
+                // is the obvious addition for the next minor version.
+                midiClient = 0;
+            }
         }
 
         // Create libremidi observer WITHOUT callbacks (we handle hotplug ourselves).
@@ -165,27 +265,54 @@ struct LrmObserver {
         refreshInternal();
     }
 
-    ~LrmObserver() {
-        // Reject any late hotplug callbacks first.
-        hotplug_callback = nullptr;
-
+    ~ObserverState() {
+        // Runs on whichever thread drops the last reference — usually the MIDI
+        // thread itself, once CoreMIDI finally lets go. Nothing to join here:
+        // requestStop() already released the caller.
         if (midiThread.joinable()) {
-            // Wait until the run loop has been published, then stop it so the
-            // thread can dispose the CoreMIDI objects and exit. If the slow
-            // first CoreMIDI contact is still running in initInternal, the stop
-            // is latched and takes effect as soon as it reaches CFRunLoopRun.
-            {
-                std::unique_lock<std::mutex> lock(runloop_mutex);
-                runloop_cv.wait(lock, [this] { return runloop_ready; });
-            }
-            CFRunLoopStop(midiRunLoop);
-            midiThread.join();
+            midiThread.detach();
         } else if (midiClient) {
             // No-thread path: normally no client is created here, dispose
             // defensively just in case.
             MIDIClientDispose(midiClient);
             midiClient = 0;
         }
+    }
+
+    // Creates the state together with the thread that co-owns it.
+    static std::shared_ptr<ObserverState> create(LrmHotplugCallback cb, void* ctx) {
+        auto self = std::make_shared<ObserverState>(cb, ctx);
+        if (cb) {
+            // The thread holds its own strong reference, so the state outlives
+            // the handle Dart gave back. That is the point: disposing must not
+            // wait for a CoreMIDI call that can take minutes to return.
+            self->midiThread = std::thread([self] { self->midiThreadMain(); });
+        }
+        return self;
+    }
+
+    // Ends the MIDI thread and stops delivering to Dart. Returns immediately;
+    // it never waits for CoreMIDI.
+    void requestStop() {
+        // Drain first: once this returns, no hotplug callback is running and
+        // none can start, so the caller may close its NativeCallable. Without
+        // it the detached thread could call into a closed callable.
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            hotplug_callback = nullptr;
+        }
+
+        if (!midiThread.joinable())
+            return;
+
+        std::lock_guard<std::mutex> lock(runloop_mutex);
+        stop_requested.store(true, std::memory_order_release);
+        if (stopSource) {
+            CFRunLoopSourceSignal(stopSource);
+            CFRunLoopWakeUp(midiRunLoop);
+        }
+        // If the run loop is not published yet the thread has not reached
+        // CFRunLoopRun either, and the flag alone ends it there.
     }
 
     // Refresh the port cache and notify. Called from the CoreMIDI notification
@@ -255,13 +382,22 @@ struct LrmObserver {
     }
 
     void notifyHotplug(int eventType) {
+        std::lock_guard<std::mutex> lock(callback_mutex);
         if (hotplug_callback) {
             hotplug_callback(hotplug_context, eventType);
         }
     }
 };
 
-static void handleMIDINotification(LrmObserver* obs, const MIDINotification* notification) {
+// The handle Dart holds. It owns one reference to the state; the MIDI thread
+// owns another. Freeing the handle therefore never has to wait for the thread:
+// whoever drops the last reference destroys the state, and if CoreMIDI is still
+// holding the thread hostage that simply happens later, on that thread.
+struct LrmObserver {
+    std::shared_ptr<ObserverState> state;
+};
+
+static void handleMIDINotification(ObserverState* obs, const MIDINotification* notification) {
     // This runs on the dedicated MIDI thread's run loop (see LrmObserver), not
     // the UI/main thread, so it is safe to refresh and notify synchronously.
 
@@ -296,10 +432,75 @@ static void handleMIDINotification(LrmObserver* obs, const MIDINotification* not
     }
 }
 
+// Ownership of the message buffers handed to Dart.
+//
+// Each incoming message is copied to the heap and released again by the Dart
+// listener through lrm_free. Invocations still queued when
+// NativeCallable.close() runs are discarded by the Dart runtime, so their
+// copies never reached lrm_free and leaked — bounded by what was in flight at
+// dispose, which for large SysEx is not nothing.
+//
+// Tracking the buffers here fixes that: the input reclaims whatever is still
+// outstanding when it closes, and lrm_free ignores a pointer that has already
+// been reclaimed, so a late Dart call cannot double free.
+namespace {
+std::mutex& message_buffers_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<void*, const void*>& message_buffers() {
+    static std::unordered_map<void*, const void*> m;
+    return m;
+}
+}
+
+// Allocates a message buffer owned by `owner` until Dart frees it or the owner
+// goes away.
+static uint8_t* claim_message_buffer(size_t size, const void* owner) {
+    auto* buffer = static_cast<uint8_t*>(std::malloc(size));
+    if (!buffer)
+        return nullptr;
+    std::lock_guard<std::mutex> lock(message_buffers_mutex());
+    message_buffers()[buffer] = owner;
+    return buffer;
+}
+
+// Frees every buffer still outstanding for `owner`.
+static void release_message_buffers_of(const void* owner) {
+    std::vector<void*> orphans;
+    {
+        std::lock_guard<std::mutex> lock(message_buffers_mutex());
+        auto& map = message_buffers();
+        for (auto it = map.begin(); it != map.end();) {
+            if (it->second == owner) {
+                orphans.push_back(it->first);
+                it = map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto* buffer : orphans)
+        std::free(buffer);
+}
+
 struct LrmMidiIn {
     std::unique_ptr<libremidi::midi_in> midi_in;
     LrmMidiCallback callback;
     void* context;
+
+    // Drains the message callback before libremidi is torn down. libremidi's
+    // midi_in destructor does not wait for an in-flight on_message: on CoreMIDI
+    // the path is ~midi_in_core -> close_port() -> MIDIPortDispose(), and
+    // MIDIPortDispose gives no guarantee that a MIDIReadProc already running on
+    // CoreMIDI's thread has returned. Without this drain, closing an input
+    // under dense traffic can run the lambda below against members that are
+    // already being destroyed, and hand Dart a buffer nobody owns any more.
+    // (Locking in a MIDI callback is not free, but this path already calls
+    // malloc per message, so it is not a new class of cost.)
+    std::mutex callback_mutex;
+    bool closing = false;
 
     LrmMidiIn(libremidi::input_port& port, LrmMidiCallback cb, void* ctx,
               bool receive_sysex, bool receive_timing, bool receive_sensing)
@@ -310,7 +511,8 @@ struct LrmMidiIn {
         config.ignore_timing = !receive_timing;
         config.ignore_sensing = !receive_sensing;
         config.on_message = [this](const libremidi::message& msg) {
-            if (!callback)
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            if (closing || !callback)
                 return;
             const size_t size = msg.bytes.size();
             if (size == 0)
@@ -321,7 +523,7 @@ struct LrmMidiIn {
             // NativeCallable.listener that reads the bytes later on the event
             // loop, so hand it an owning heap copy and let it release the copy
             // via lrm_free once it has been read.
-            auto* copy = static_cast<uint8_t*>(std::malloc(size));
+            auto* copy = claim_message_buffer(size, this);
             if (!copy)
                 return;
             std::memcpy(copy, msg.bytes.data(), size);
@@ -329,7 +531,29 @@ struct LrmMidiIn {
         };
 
         midi_in = std::make_unique<libremidi::midi_in>(std::move(config));
-        midi_in->open_port(port);
+        // Propagate a failed open. libremidi reports it as a return value, not
+        // an exception; ignoring it handed Dart a live LrmMidiIn* for a port
+        // that was never opened, so every later call silently did nothing.
+        // The lrm_midi_in_open* wrappers turn this into a nullptr result.
+        if (auto err = midi_in->open_port(port); err != stdx::error{}) {
+            throw std::runtime_error("open_port failed");
+        }
+    }
+
+    ~LrmMidiIn() {
+        // Reject further deliveries, wait for one that is already inside the
+        // callback, and only then let libremidi close the port. This closes the
+        // window we own. A delivery that *starts* during libremidi's own
+        // teardown still dereferences libremidi's object before ever reaching
+        // our lambda — that part cannot be fixed from here.
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            closing = true;
+        }
+        midi_in.reset();
+        // Nothing can deliver any more, so anything still outstanding will
+        // never come back through lrm_free. Reclaim it.
+        release_message_buffers_of(this);
     }
 };
 
@@ -338,7 +562,10 @@ struct LrmMidiOut {
 
     LrmMidiOut(libremidi::output_port& port) {
         midi_out = std::make_unique<libremidi::midi_out>();
-        midi_out->open_port(port);
+        // See LrmMidiIn: a failed open must not look like success.
+        if (auto err = midi_out->open_port(port); err != stdx::error{}) {
+            throw std::runtime_error("open_port failed");
+        }
     }
 };
 
@@ -347,12 +574,23 @@ struct LrmMidiOut {
 // =============================================================================
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
-    return "0.8.5";
+    return "0.8.6";
 }
 
-// Free a heap buffer handed to Dart by the input callback. Uses the library's
-// own allocator so the caller does not depend on a matching C runtime.
+// Free a heap buffer handed to Dart by the input callback. Ignores a pointer
+// that is not outstanding: the owning input may have reclaimed it already when
+// it closed, and the Dart listener can still be holding a stale copy of it.
 extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
+    if (!ptr)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(message_buffers_mutex());
+        auto& map = message_buffers();
+        auto it = map.find(ptr);
+        if (it == map.end())
+            return;
+        map.erase(it);
+    }
     std::free(ptr);
 }
 
@@ -362,7 +600,7 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
 
 extern "C" FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new(void) {
     try {
-        return new LrmObserver();
+        return new LrmObserver{ObserverState::create(nullptr, nullptr)};
     } catch (...) {
         return nullptr;
     }
@@ -373,31 +611,44 @@ extern "C" FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new_with_callbacks(
     void* context
 ) {
     try {
-        return new LrmObserver(callback, context);
+        return new LrmObserver{ObserverState::create(callback, context)};
     } catch (...) {
         return nullptr;
     }
 }
 
 extern "C" FFI_PLUGIN_EXPORT void lrm_observer_free(LrmObserver* observer) {
+    if (!observer) return;
+    // Ask the thread to finish and stop calling into Dart, then drop this
+    // handle's reference. Returns straight away even when the thread is still
+    // inside a CoreMIDI call that has not come back yet — which used to block
+    // the calling isolate for as long as CoreMIDI took.
+    observer->state->requestStop();
     delete observer;
+}
+
+extern "C" FFI_PLUGIN_EXPORT bool lrm_observer_hotplug_available(LrmObserver* observer) {
+    if (!observer) return false;
+    const auto& state = *observer->state;
+    return state.wants_hotplug
+        && state.client_status.load(std::memory_order_acquire) == noErr;
 }
 
 extern "C" FFI_PLUGIN_EXPORT void lrm_observer_refresh(LrmObserver* observer) {
     if (!observer) return;
-    observer->refresh();
+    observer->state->refresh();
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input_count(LrmObserver* observer) {
     if (!observer) return 0;
-    std::lock_guard<std::mutex> lock(observer->ports_mutex);
-    return static_cast<int32_t>(observer->input_ports.size());
+    std::lock_guard<std::mutex> lock(observer->state->ports_mutex);
+    return static_cast<int32_t>(observer->state->input_ports.size());
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output_count(LrmObserver* observer) {
     if (!observer) return 0;
-    std::lock_guard<std::mutex> lock(observer->ports_mutex);
-    return static_cast<int32_t>(observer->output_ports.size());
+    std::lock_guard<std::mutex> lock(observer->state->ports_mutex);
+    return static_cast<int32_t>(observer->state->output_ports.size());
 }
 
 // Helper to copy string safely
@@ -406,10 +657,14 @@ static void safe_strcpy(char* dest, size_t dest_size, const std::string& src) {
     dest[dest_size - 1] = '\0';
 }
 
-// FNV-1a 64-bit hash for stable_id generation
+// FNV-1a 64-bit hash for stable_id generation.
+// Iterates over unsigned char: plain `char` is signed on x86/arm64 but unsigned
+// on some ABIs, so a byte >= 0x80 (any non-ASCII port name) would sign-extend
+// to a different 64-bit value per platform and break the "cross-platform stable
+// id" promise. Must stay identical to the copy in src/libremidi_flutter.cpp.
 static uint64_t fnv1a_hash(const std::string& str) {
     uint64_t hash = 14695981039346656037ULL; // FNV offset basis
-    for (char c : str) {
+    for (unsigned char c : str) {
         hash ^= static_cast<uint64_t>(c);
         hash *= 1099511628211ULL; // FNV prime
     }
@@ -457,7 +712,7 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input(LrmObserver* observe
     if (index < 0) return LRM_ERR_NOT_FOUND;
 
     libremidi::input_port port;
-    if (!observer->getInputPort(static_cast<size_t>(index), port)) {
+    if (!observer->state->getInputPort(static_cast<size_t>(index), port)) {
         return LRM_ERR_NOT_FOUND;
     }
 
@@ -470,7 +725,7 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_output(LrmObserver* observ
     if (index < 0) return LRM_ERR_NOT_FOUND;
 
     libremidi::output_port port;
-    if (!observer->getOutputPort(static_cast<size_t>(index), port)) {
+    if (!observer->state->getOutputPort(static_cast<size_t>(index), port)) {
         return LRM_ERR_NOT_FOUND;
     }
 
@@ -507,11 +762,11 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
     if (!observer || !saved) return -1;
     // Hold ports_mutex for the whole match: hotplug refresh replaces these
     // vectors under the same lock, so reading them unlocked would race with it.
-    std::lock_guard<std::mutex> lock(observer->ports_mutex);
+    std::lock_guard<std::mutex> lock(observer->state->ports_mutex);
     if (is_input) {
-        return find_closest_port_impl(observer->input_ports, saved);
+        return find_closest_port_impl(observer->state->input_ports, saved);
     } else {
-        return find_closest_port_impl(observer->output_ports, saved);
+        return find_closest_port_impl(observer->state->output_ports, saved);
     }
 }
 
@@ -524,7 +779,7 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open(LrmObserver* observer
     if (port_index < 0) return nullptr;
 
     libremidi::output_port port;
-    if (!observer->getOutputPort(static_cast<size_t>(port_index), port)) {
+    if (!observer->state->getOutputPort(static_cast<size_t>(port_index), port)) {
         return nullptr;
     }
 
@@ -539,7 +794,7 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* ob
     if (!observer) return nullptr;
 
     libremidi::output_port port;
-    if (!observer->getOutputPortById(port_id, port)) {
+    if (!observer->state->getOutputPortById(port_id, port)) {
         return nullptr;
     }
 
@@ -563,7 +818,12 @@ extern "C" FFI_PLUGIN_EXPORT int32_t lrm_midi_out_send(LrmMidiOut* midi_out, con
     if (!midi_out || !midi_out->midi_out || !data) return LRM_ERR_INVALID;
 
     try {
-        midi_out->midi_out->send_message(data, length);
+        // send_message reports failure by return value. Only reporting thrown
+        // exceptions made this return LRM_OK for sends the backend rejected.
+        if (auto err = midi_out->midi_out->send_message(data, length);
+            err != stdx::error{}) {
+            return LRM_ERR_SEND_FAILED;
+        }
         return LRM_OK;
     } catch (...) {
         return LRM_ERR_SEND_FAILED;
@@ -587,7 +847,7 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open(
     if (port_index < 0) return nullptr;
 
     libremidi::input_port port;
-    if (!observer->getInputPort(static_cast<size_t>(port_index), port)) {
+    if (!observer->state->getInputPort(static_cast<size_t>(port_index), port)) {
         return nullptr;
     }
 
@@ -611,7 +871,7 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
     if (!observer) return nullptr;
 
     libremidi::input_port port;
-    if (!observer->getInputPortById(port_id, port)) {
+    if (!observer->state->getInputPortById(port_id, port)) {
         return nullptr;
     }
 

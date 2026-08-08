@@ -25,6 +25,10 @@ let package = Package(
                 .define("LIBREMIDI_HEADER_ONLY", to: "1"),
                 .define("LIBREMIDI_COREMIDI", to: "1"),
                 .headerSearchPath("include/libremidi_flutter"),
+                // Before libremidi_headers: src carries patched copies of
+                // libremidi headers that must win over the vendored originals
+                // (see src/libremidi/backends/coremidi).
+                .headerSearchPath("patched_libremidi"),
                 .headerSearchPath("libremidi_headers"),
                 // libremidi's CoreMIDI backend pulls in the coremidi_ump
                 // (MIDI 2.0) backend, which references macOS 11 / iOS 14 APIs.

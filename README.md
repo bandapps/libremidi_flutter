@@ -20,7 +20,7 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 
 ```yaml
 dependencies:
-  libremidi_flutter: ^0.8.5
+  libremidi_flutter: ^0.8.6
 ```
 
 ## Usage
@@ -249,7 +249,7 @@ input.messagesFiltered(excludeSysEx: true).listen((msg) { ... });
 
 ```dart
 input.messages.listen((msg) {
-  print('Received at ${msg.timestamp}µs: ${msg.data}');
+  print('Received at ${msg.timestamp}ns: ${msg.data}');
 });
 ```
 

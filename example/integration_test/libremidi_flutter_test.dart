@@ -2,6 +2,22 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
 
+
+/// Returns an input port that is safe to open in an automated test.
+///
+/// Never returns hardware. These tests used to take `inputs.first`, which on a
+/// developer machine is whatever USB device happens to be plugged in — opening
+/// and closing real hardware from a test run is how a connected MIDI device
+/// ends up needing to be physically re-plugged. Only virtual/software ports
+/// (an IAC bus on macOS, a loopback port elsewhere) are acceptable, and when
+/// there is none the test skips rather than reaching for hardware.
+MidiPort? safeTestInput(MidiObserver observer) {
+  for (final port in observer.getInputPorts()) {
+    if (port.isVirtual) return port;
+  }
+  return null;
+}
+
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
@@ -362,9 +378,9 @@ void main() {
     ) async {
       final observer = MidiObserver();
       try {
-        final inputs = observer.getInputPorts();
-        if (inputs.isEmpty) return;
-        final input = observer.openInput(inputs.first);
+        final port = safeTestInput(observer);
+        if (port == null) return;
+        final input = observer.openInput(port);
         final sub = input.messages.listen((_) {});
         await tester.pump(const Duration(milliseconds: 50));
         await sub.cancel();
@@ -379,9 +395,9 @@ void main() {
     ) async {
       final observer = MidiObserver();
       try {
-        final inputs = observer.getInputPorts();
-        if (inputs.isEmpty) return;
-        final input = observer.openInput(inputs.first);
+        final port = safeTestInput(observer);
+        if (port == null) return;
+        final input = observer.openInput(port);
         input.dispose();
       } finally {
         observer.dispose();

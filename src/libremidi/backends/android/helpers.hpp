@@ -10,6 +10,7 @@
 #include <jni.h>
 #include <pthread.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 #include <functional>
@@ -40,14 +41,29 @@ struct context
   static inline std::string client_name;
   static inline std::vector<midi_port_entry> midi_ports;
 
+  // Guards midi_ports.
+  //
+  // The cache is rebuilt for one direction at a time and then read positionally
+  // ("refresh, then ask for entry i"), and inputs and outputs share it — so an
+  // output enumeration running between another caller's refresh and its reads
+  // silently replaced the list under it, and cleanup_devices() deleted the
+  // global references that caller was still indexing. Every refresh-and-read
+  // sequence must therefore hold this lock for its whole duration, not just
+  // around single operations.
+  //
+  // Recursive so the individual accessors below can lock defensively while
+  // still being callable from inside a sequence that already holds it.
+  static std::recursive_mutex& ports_mutex();
+
   static JNIEnv* get_thread_env();
   static jobject get_context(JNIEnv* env);
   static jobject get_midi_manager(JNIEnv* env, jobject context);
   static void refresh_midi_devices(JNIEnv* env, jobject context, bool is_output);
-  static void open_device(const midi_port_entry& port_entry, void* target, bool is_output);
+  // Returns false when nothing was handed to Java, i.e. no callback will ever
+  // arrive for this token. The token is released on those paths.
+  static bool open_device(const midi_port_entry& port_entry, int64_t token, bool is_output);
   static std::string port_name(JNIEnv* env, unsigned int port_number);
   static void cleanup_devices(JNIEnv* env);
-  static inline int pending_port_index = 0;  // Port index to open in callback
 
   // Extended port info functions
   static std::string port_manufacturer(JNIEnv* env, unsigned int port_number);
@@ -69,9 +85,40 @@ extern "C" JNIEXPORT void JNICALL Java_dev_celtera_libremidi_MidiDeviceStatusCal
 extern "C" JNIEXPORT void JNICALL Java_dev_celtera_libremidi_MidiDeviceStatusCallback_onDeviceRemovedNative(
     JNIEnv* env, jobject /*thiz*/, jlong observer_ptr, jobject device_info);
 
+// Bookkeeping for the asynchronous device open.
+//
+// MidiManager.openDevice() is asynchronous: it returns immediately and calls
+// back later. Previously the midi_in/midi_out pointer was handed to Java
+// directly and the port index was parked in one process-wide variable. Both
+// were broken:
+//
+//   - closing the port before the callback arrived left Java holding a pointer
+//     to a destroyed object, which it then wrote through;
+//   - two overlapping opens overwrote each other's port index, so a callback
+//     could open a different port than the one that was requested.
+//
+// Java now receives an opaque token instead. The token resolves — under a lock,
+// and only once — to the requesting object *and* its port index. A token whose
+// requester has been closed in the meantime resolves to nothing, so the late
+// callback has nothing to write to.
+struct pending_open
+{
+  void* target;
+  int port_index;
+  bool is_output;
+};
+
+int64_t register_pending_open(void* target, int port_index, bool is_output);
+void cancel_pending_open(void* target);
+// Marks the entry as in flight and hands out its contents. The entry stays in
+// the registry until finish_pending_open(), so cancel_pending_open() blocks
+// instead of letting the target be destroyed mid-callback.
+bool take_pending_open(int64_t token, pending_open& out);
+void finish_pending_open(int64_t token);
+
 // Hotplug observer registration (defined in android_helpers.cpp)
 using hotplug_callback_t = void (*)(void* observer);
 void set_hotplug_observer(void* observer, hotplug_callback_t on_added, hotplug_callback_t on_removed);
-void clear_hotplug_observer();
+void clear_hotplug_observer(void* observer);
 }
 }

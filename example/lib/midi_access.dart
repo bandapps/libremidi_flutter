@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert' show utf8;
 
 import 'package:flutter/services.dart';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
@@ -18,7 +19,20 @@ class MidiDevice {
   int get outputCount => outputPorts.length;
 
   /// Stable ID based on device identity (not ports, which can change).
-  int get stableId => '$name|${manufacturer ?? ''}|${serial ?? ''}'.hashCode;
+  ///
+  /// Uses FNV-1a rather than String.hashCode: Dart makes no promise that
+  /// hashCode is the same value in another process or another SDK version, so
+  /// persisting it would hand back a different id after a restart or an
+  /// upgrade.
+  int get stableId {
+    var hash = 0xcbf29ce484222325;
+    for (final byte in utf8.encode(_identityKey)) {
+      hash = ((hash ^ byte) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    }
+    return hash;
+  }
+
+  String get _identityKey => '$name|${manufacturer ?? ''}|${serial ?? ''}';
 
   String get transportName => transportType?.name ?? '';
 }
@@ -186,26 +200,39 @@ class LibremidiMidiAccess extends MidiAccess {
     final inputs = LibremidiFlutter.getInputPorts();
     final outputs = LibremidiFlutter.getOutputPorts();
 
+    // Group by device identity: the name, plus the serial when the platform
+    // supplies one.
+    // Grouping on the name merged two identical devices into one entry and
+    // pooled their ports — the very case the plugin now keeps apart with
+    // distinct port ids. Where the platform supplies a serial this separates
+    // them correctly; where it does not (some Android and WinUWP devices
+    // report nothing but a name) they remain indistinguishable in the data
+    // itself, and merging is then the honest outcome.
     final deviceMap = <String, MidiDevice>{};
+
+    MidiDevice deviceFor(MidiPortRef ref) {
+      final name = ref.deviceName.isNotEmpty ? ref.deviceName : ref.displayName;
+      // Only the serial may join the key. manufacturer and product are
+      // per-endpoint properties on CoreMIDI, and a device's source and
+      // destination can report them differently — including them split one
+      // device into an input-only and an output-only entry, and selecting the
+      // input one left the app with no output to send to.
+      final key = ref.serial.isNotEmpty ? '$name|${ref.serial}' : name;
+      final device = deviceMap.putIfAbsent(key, () => MidiDevice(name));
+      device.manufacturer ??= ref.manufacturer;
+      device.serial ??= ref.serial;
+      device.transportType ??= ref.transportType;
+      return device;
+    }
 
     for (final port in inputs) {
       final ref = _toPortRef(port);
-      final name = ref.deviceName.isNotEmpty ? ref.deviceName : ref.displayName;
-      deviceMap.putIfAbsent(name, () => MidiDevice(name));
-      deviceMap[name]!.inputPorts.add(ref);
-      deviceMap[name]!.manufacturer ??= ref.manufacturer;
-      deviceMap[name]!.serial ??= ref.serial;
-      deviceMap[name]!.transportType ??= ref.transportType;
+      deviceFor(ref).inputPorts.add(ref);
     }
 
     for (final port in outputs) {
       final ref = _toPortRef(port);
-      final name = ref.deviceName.isNotEmpty ? ref.deviceName : ref.displayName;
-      deviceMap.putIfAbsent(name, () => MidiDevice(name));
-      deviceMap[name]!.outputPorts.add(ref);
-      deviceMap[name]!.manufacturer ??= ref.manufacturer;
-      deviceMap[name]!.serial ??= ref.serial;
-      deviceMap[name]!.transportType ??= ref.transportType;
+      deviceFor(ref).outputPorts.add(ref);
     }
 
     return deviceMap.values.toList()..sort((a, b) => a.name.compareTo(b.name));
