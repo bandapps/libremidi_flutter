@@ -1,11 +1,12 @@
-// Patched version of libremidi/backends/android/observer.hpp
-// Populates all port info fields (manufacturer, product, serial, etc.)
-// Adds hotplug support via MidiManager.DeviceCallback
+// Replaces upstream libremidi's backends/android/observer.hpp: fills in all
+// port information and reports hotplug. See helpers.hpp for the Java side.
 
 #pragma once
-#include <libremidi/backends/android/helpers.hpp>
 #include <libremidi/backends/android/config.hpp>
+#include <libremidi/backends/android/helpers.hpp>
 #include <libremidi/detail/observer.hpp>
+
+#include <mutex>
 #include <set>
 
 NAMESPACE_LIBREMIDI
@@ -17,87 +18,34 @@ class observer final
     , public error_handler
 {
 public:
-  struct
-      : libremidi::observer_configuration
-      , libremidi::android::observer_configuration
+  explicit observer(libremidi::observer_configuration&& conf, observer_configuration)
+      : configuration{std::move(conf)}
   {
-  } configuration;
+    if (!configuration.has_callbacks())
+      return;
 
-  explicit observer(
-      libremidi::observer_configuration&& conf, libremidi::android::observer_configuration aconf)
-      : configuration{std::move(conf), std::move(aconf)}
-  {
-    if (!context::client_name.empty() && context::client_name != configuration.client_name)
     {
-      LOGW("Android backend only supports one client name per process");
-    }
-    context::client_name = std::string(configuration.client_name);
-
-    // Initialize hotplug if callbacks are set
-    if (configuration.has_callbacks())
-    {
-      auto env = context::get_thread_env();
-      if (env)
-      {
-        auto ctx = context::get_context(env);
-        if (ctx)
-        {
-          auto local_manager = context::get_midi_manager(env, ctx);
-          if (local_manager)
-          {
-            // Keep a global ref to the midi manager; drop the local one, which
-            // this thread would otherwise hold until it returns to Java.
-            midi_manager = env->NewGlobalRef(local_manager);
-            env->DeleteLocalRef(local_manager);
-
-            // Register for device callbacks
-            device_callback = context::register_device_callback(env, midi_manager, this);
-
-            // Set up the static callback handlers
-            android::set_hotplug_observer(this, &observer::on_device_added_static, &observer::on_device_removed_static);
-          }
-        }
-      }
-
-      // Notify of existing ports if requested
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      cached_inputs = get_input_ports();
+      cached_outputs = get_output_ports();
       if (configuration.notify_in_constructor)
       {
         if (configuration.input_added)
-          for (auto& p : get_input_ports())
+          for (const auto& p : cached_inputs)
             configuration.input_added(p);
-
         if (configuration.output_added)
-          for (auto& p : get_output_ports())
+          for (const auto& p : cached_outputs)
             configuration.output_added(p);
       }
-
-      // Initialize port cache for diff-based notifications
-      cached_inputs = get_input_ports();
-      cached_outputs = get_output_ports();
     }
+    hotplug_id = register_hotplug([this] { on_devices_changed(); });
   }
 
   ~observer()
   {
-    auto env = context::get_thread_env();
-    if (env)
-    {
-      // Unregister device callback
-      if (midi_manager && device_callback)
-      {
-        android::clear_hotplug_observer(this);
-        context::unregister_device_callback(env, midi_manager, device_callback);
-        device_callback = nullptr;
-      }
-
-      if (midi_manager)
-      {
-        env->DeleteGlobalRef(midi_manager);
-        midi_manager = nullptr;
-      }
-
-      context::cleanup_devices(env);
-    }
+    // Waits for a running notification, so nothing below is touched afterwards.
+    if (hotplug_id >= 0)
+      unregister_hotplug(hotplug_id);
   }
 
   libremidi::API get_current_api() const noexcept override
@@ -107,235 +55,113 @@ public:
 
   std::vector<libremidi::input_port> get_input_ports() const noexcept override
   {
-    auto env = context::get_thread_env();
-    if (!env)
-      return {};
-
-    auto ctx = context::get_context(env);
-    if (!ctx)
-      return {};
-
-    // Hold the cache lock across the refresh *and* all the positional reads
-    // below: the entries are indexed by position, so another direction's
-    // enumeration running in between would swap the list out under us and free
-    // the global references we are about to read.
-    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
-    context::refresh_midi_devices(env, ctx, false);
-
-    std::vector<libremidi::input_port> ports;
-    for (size_t i = 0; i < context::midi_ports.size(); ++i)
-    {
-      libremidi::input_port port;
-      port.api = libremidi::API::ANDROID_AMIDI;
-      port.port = i;
-
-      // Populate all port info fields
-      std::string name = context::port_name(env, i);
-      std::string manufacturer = context::port_manufacturer(env, i);
-      std::string product = context::port_product(env, i);
-      std::string serial = context::port_serial(env, i);
-      int android_type = context::port_type(env, i);
-
-      // Map Android device type to libremidi transport_type
-      // Android: TYPE_USB=1, TYPE_VIRTUAL=2, TYPE_BLUETOOTH=3
-      libremidi::transport_type type = libremidi::transport_type::unknown;
-      switch (android_type) {
-        case 1: // TYPE_USB
-          type = static_cast<libremidi::transport_type>(
-              static_cast<int>(libremidi::transport_type::hardware) |
-              static_cast<int>(libremidi::transport_type::usb));
-          break;
-        case 2: // TYPE_VIRTUAL
-          type = libremidi::transport_type::software;
-          break;
-        case 3: // TYPE_BLUETOOTH
-          type = static_cast<libremidi::transport_type>(
-              static_cast<int>(libremidi::transport_type::hardware) |
-              static_cast<int>(libremidi::transport_type::bluetooth));
-          break;
-      }
-
-      // Use product as device_name if available (like macOS uses Model)
-      // Otherwise fall back to name
-      port.port_name = name;
-      port.device_name = product.empty() ? name : product;
-      port.display_name = name;
-      port.manufacturer = manufacturer;
-      port.product = product;
-      port.serial = serial;
-      port.type = type;
-
-      ports.push_back(std::move(port));
-    }
-
-    return ports;
+    return to_ports<libremidi::input_port>(list_ports(true));
   }
 
   std::vector<libremidi::output_port> get_output_ports() const noexcept override
   {
-    auto env = context::get_thread_env();
-    if (!env)
-      return {};
-
-    auto ctx = context::get_context(env);
-    if (!ctx)
-      return {};
-
-    // See get_input_ports: refresh and positional reads are one atomic unit.
-    std::lock_guard<std::recursive_mutex> lock(context::ports_mutex());
-    context::refresh_midi_devices(env, ctx, true);
-
-    std::vector<libremidi::output_port> ports;
-    for (size_t i = 0; i < context::midi_ports.size(); ++i)
-    {
-      libremidi::output_port port;
-      port.api = libremidi::API::ANDROID_AMIDI;
-      port.port = i;
-
-      // Populate all port info fields
-      std::string name = context::port_name(env, i);
-      std::string manufacturer = context::port_manufacturer(env, i);
-      std::string product = context::port_product(env, i);
-      std::string serial = context::port_serial(env, i);
-      int android_type = context::port_type(env, i);
-
-      // Map Android device type to libremidi transport_type
-      // Android: TYPE_USB=1, TYPE_VIRTUAL=2, TYPE_BLUETOOTH=3
-      libremidi::transport_type type = libremidi::transport_type::unknown;
-      switch (android_type) {
-        case 1: // TYPE_USB
-          type = static_cast<libremidi::transport_type>(
-              static_cast<int>(libremidi::transport_type::hardware) |
-              static_cast<int>(libremidi::transport_type::usb));
-          break;
-        case 2: // TYPE_VIRTUAL
-          type = libremidi::transport_type::software;
-          break;
-        case 3: // TYPE_BLUETOOTH
-          type = static_cast<libremidi::transport_type>(
-              static_cast<int>(libremidi::transport_type::hardware) |
-              static_cast<int>(libremidi::transport_type::bluetooth));
-          break;
-      }
-
-      // Use product as device_name if available (like macOS uses Model)
-      // Otherwise fall back to name
-      port.port_name = name;
-      port.device_name = product.empty() ? name : product;
-      port.display_name = name;
-      port.manufacturer = manufacturer;
-      port.product = product;
-      port.serial = serial;
-      port.type = type;
-
-      ports.push_back(std::move(port));
-    }
-
-    return ports;
+    return to_ports<libremidi::output_port>(list_ports(false));
   }
 
 private:
-  jobject midi_manager = nullptr;
-  jobject device_callback = nullptr;
+  template <typename Port>
+  static std::vector<Port> to_ports(const std::vector<port_desc>& descs)
+  {
+    std::vector<Port> ports;
+    ports.reserve(descs.size());
+    for (const auto& d : descs)
+    {
+      Port port;
+      port.api = libremidi::API::ANDROID_AMIDI;
+      port.port = make_port_handle(d.device_id, d.port_index);
 
-  // Port cache for diff-based notifications
-  std::vector<libremidi::input_port> cached_inputs;
-  std::vector<libremidi::output_port> cached_outputs;
+      // Virtual devices (MidiDeviceService apps) often declare only
+      // manufacturer and product — Google's own sample does — which used to
+      // leave the port named just " Port 1".
+      std::string name = d.name;
+      if (name.empty())
+        name = d.product;
+      if (name.empty())
+        name = d.manufacturer;
+      if (name.empty())
+        name = "MIDI Device";
+      // Port number distinguishes the ports of one device (1-based for display).
+      name += " Port " + std::to_string(d.port_index + 1);
 
-  // Generate unique key for port identification (indices are not stable on Android)
-  template<typename PortType>
-  static std::string port_key(const PortType& p) {
+      port.port_name = name;
+      port.display_name = name;
+      port.device_name = d.product.empty() ? name : d.product;
+      port.manufacturer = d.manufacturer;
+      port.product = d.product;
+      port.serial = d.serial;
+      port.type = transport_for(d.type);
+      ports.push_back(std::move(port));
+    }
+    return ports;
+  }
+
+  static libremidi::transport_type transport_for(int32_t android_type)
+  {
+    using t = libremidi::transport_type;
+    switch (android_type)
+    {
+      case 1: // MidiDeviceInfo.TYPE_USB
+        return static_cast<t>(static_cast<int>(t::hardware) | static_cast<int>(t::usb));
+      case 2: // TYPE_VIRTUAL
+        return t::software;
+      case 3: // TYPE_BLUETOOTH
+        return static_cast<t>(static_cast<int>(t::hardware) | static_cast<int>(t::bluetooth));
+      default:
+        return t::unknown;
+    }
+  }
+
+  // Ports are matched by their identifying strings, not by handle: Android
+  // hands out a new device id when a device reconnects.
+  template <typename Port>
+  static std::string port_key(const Port& p)
+  {
     return p.port_name + "|" + p.manufacturer + "|" + p.product + "|" + p.serial;
   }
 
-  // Update cache and return only the newly added ports
-  template<typename PortType>
-  std::vector<PortType> diff_added(const std::vector<PortType>& current, std::vector<PortType>& cache) {
-    std::vector<PortType> added;
-    std::set<std::string> cached_keys;
+  template <typename Port, typename Callback>
+  static void report_changes(
+      std::vector<Port>& cache, std::vector<Port> current, const Callback& added,
+      const Callback& removed)
+  {
+    std::set<std::string> before, after;
     for (const auto& p : cache)
-      cached_keys.insert(port_key(p));
-
-    for (const auto& p : current) {
-      if (cached_keys.find(port_key(p)) == cached_keys.end())
-        added.push_back(p);
-    }
-
-    cache = current;
-    return added;
-  }
-
-  // Update cache and return only the removed ports
-  template<typename PortType>
-  std::vector<PortType> diff_removed(const std::vector<PortType>& current, std::vector<PortType>& cache) {
-    std::vector<PortType> removed;
-    std::set<std::string> current_keys;
+      before.insert(port_key(p));
     for (const auto& p : current)
-      current_keys.insert(port_key(p));
+      after.insert(port_key(p));
 
-    for (const auto& p : cache) {
-      if (current_keys.find(port_key(p)) == current_keys.end())
-        removed.push_back(p);
-    }
-
-    cache = current;
-    return removed;
+    if (removed)
+      for (const auto& p : cache)
+        if (!after.count(port_key(p)))
+          removed(p);
+    if (added)
+      for (const auto& p : current)
+        if (!before.count(port_key(p)))
+          added(p);
+    cache = std::move(current);
   }
 
-  // Static callbacks that forward to instance methods
-  static void on_device_added_static(void* observer_ptr)
+  // Runs on the MIDI thread.
+  void on_devices_changed()
   {
-    auto* self = static_cast<observer*>(observer_ptr);
-    if (self)
-      self->on_device_added();
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    report_changes(
+        cached_inputs, get_input_ports(), configuration.input_added, configuration.input_removed);
+    report_changes(
+        cached_outputs, get_output_ports(), configuration.output_added,
+        configuration.output_removed);
   }
 
-  static void on_device_removed_static(void* observer_ptr)
-  {
-    auto* self = static_cast<observer*>(observer_ptr);
-    if (self)
-      self->on_device_removed();
-  }
-
-  void on_device_added()
-  {
-    LOGI("on_device_added called");
-    // Use diff to only notify about actually new ports
-    if (configuration.input_added)
-    {
-      auto added = diff_added(get_input_ports(), cached_inputs);
-      LOGI("  %zu new input ports", added.size());
-      for (auto& p : added)
-        configuration.input_added(p);
-    }
-    if (configuration.output_added)
-    {
-      auto added = diff_added(get_output_ports(), cached_outputs);
-      LOGI("  %zu new output ports", added.size());
-      for (auto& p : added)
-        configuration.output_added(p);
-    }
-  }
-
-  void on_device_removed()
-  {
-    LOGI("on_device_removed called");
-    // Use diff to only notify about actually removed ports
-    if (configuration.input_removed)
-    {
-      auto removed = diff_removed(get_input_ports(), cached_inputs);
-      LOGI("  %zu removed input ports", removed.size());
-      for (auto& p : removed)
-        configuration.input_removed(p);
-    }
-    if (configuration.output_removed)
-    {
-      auto removed = diff_removed(get_output_ports(), cached_outputs);
-      LOGI("  %zu removed output ports", removed.size());
-      for (auto& p : removed)
-        configuration.output_removed(p);
-    }
-  }
+  libremidi::observer_configuration configuration;
+  std::mutex cache_mutex;
+  std::vector<libremidi::input_port> cached_inputs;
+  std::vector<libremidi::output_port> cached_outputs;
+  int hotplug_id = -1;
 };
 }
 }

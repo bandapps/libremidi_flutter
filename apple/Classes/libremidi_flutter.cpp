@@ -12,6 +12,7 @@
 
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
+#include <dart_api/dart_native_api.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -23,6 +24,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// Where a *_with_port export delivers to; see "Delivery to a Dart native port".
+struct DartPortSink {
+    LrmPostCObject post;
+    int64_t port;
+};
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
@@ -62,6 +69,10 @@ struct ObserverState {
     // answer halfway through initialisation.
     const bool wants_hotplug;
     void* hotplug_context;
+    // Set by lrm_observer_new_with_port: the context hotplug_callback posts to.
+    // Owned here, not by the handle, because this state can outlive the handle
+    // (see LrmObserver); requestStop() ends all use of it.
+    std::unique_ptr<DartPortSink> port_sink;
     mutable std::mutex ports_mutex;
 
     MIDIClientRef midiClient;
@@ -489,6 +500,8 @@ struct LrmMidiIn {
     std::unique_ptr<libremidi::midi_in> midi_in;
     LrmMidiCallback callback;
     void* context;
+    // Set by lrm_midi_in_open_by_id_with_port: the context callback posts to.
+    std::unique_ptr<DartPortSink> port_sink;
 
     // Drains the message callback before libremidi is torn down. libremidi's
     // midi_in destructor does not wait for an in-flight on_message: on CoreMIDI
@@ -577,6 +590,11 @@ extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
     return "0.8.7";
 }
 
+// Open failures carry no reason on Apple platforms (see the header).
+extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_last_error(void) {
+    return "";
+}
+
 // Free a heap buffer handed to Dart by the input callback. Ignores a pointer
 // that is not outstanding: the owning input may have reclaimed it already when
 // it closed, and the Dart listener can still be holding a stale copy of it.
@@ -592,6 +610,53 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_free(void* ptr) {
         map.erase(it);
     }
     std::free(ptr);
+}
+
+// =============================================================================
+// Delivery to a Dart native port
+// =============================================================================
+//
+// The *_with_port exports reuse the callback paths above with these adapters
+// as the callback and a DartPortSink as its context. The sink is owned by the
+// LrmObserver / LrmMidiIn it serves, so it lives exactly as long as the
+// callback can run — the existing teardown (which waits out a running
+// delivery) covers it too.
+//
+// Posting instead of calling a NativeCallable is what makes an ended isolate
+// harmless: Dart_PostCObject on a closed port returns false and drops the
+// message, whereas invoking a deleted NativeCallable aborts the process. That
+// happened whenever an isolate ended — or the app was hot restarted — with an
+// input or hotplug observer still open. Must stay in sync with the other
+// native copy. DartPortSink itself is defined near the top of the file.
+
+static void post_hotplug_to_port(void* context, int32_t event_type) {
+    auto* sink = static_cast<DartPortSink*>(context);
+    Dart_CObject event;
+    event.type = Dart_CObject_kInt64;
+    event.value.as_int64 = event_type;
+    sink->post(sink->port, &event);
+}
+
+static void post_midi_to_port(void* context, const uint8_t* data, size_t length,
+                              int64_t timestamp) {
+    auto* sink = static_cast<DartPortSink*>(context);
+    Dart_CObject bytes;
+    bytes.type = Dart_CObject_kTypedData;
+    bytes.value.as_typed_data.type = Dart_TypedData_kUint8;
+    bytes.value.as_typed_data.length = static_cast<intptr_t>(length);
+    bytes.value.as_typed_data.values = data;
+    Dart_CObject stamp;
+    stamp.type = Dart_CObject_kInt64;
+    stamp.value.as_int64 = timestamp;
+    Dart_CObject* items[] = {&bytes, &stamp};
+    Dart_CObject message;
+    message.type = Dart_CObject_kArray;
+    message.value.as_array.length = 2;
+    message.value.as_array.values = items;
+    // The post copies the bytes into the Dart heap, so the buffer the callback
+    // path allocated for them can go right away.
+    sink->post(sink->port, &message);
+    lrm_free(const_cast<uint8_t*>(data));
 }
 
 // =============================================================================
@@ -612,6 +677,22 @@ extern "C" FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new_with_callbacks(
 ) {
     try {
         return new LrmObserver{ObserverState::create(callback, context)};
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new_with_port(
+    LrmPostCObject post,
+    int64_t port
+) {
+    if (!post) return nullptr;
+    try {
+        auto sink = std::make_unique<DartPortSink>(DartPortSink{post, port});
+        auto state = ObserverState::create(post_hotplug_to_port, sink.get());
+        // The MIDI thread may already deliver; it only uses the sink's address.
+        state->port_sink = std::move(sink);
+        return new LrmObserver{std::move(state)};
     } catch (...) {
         return nullptr;
     }
@@ -890,4 +971,194 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_midi_in_close(LrmMidiIn* midi_in) {
 extern "C" FFI_PLUGIN_EXPORT bool lrm_midi_in_is_connected(LrmMidiIn* midi_in) {
     if (!midi_in || !midi_in->midi_in) return false;
     return midi_in->midi_in->is_port_connected();
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id_with_port(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+) {
+    if (!post) return nullptr;
+    std::unique_ptr<DartPortSink> sink;
+    try {
+        sink = std::make_unique<DartPortSink>(DartPortSink{post, port});
+    } catch (...) {
+        return nullptr;
+    }
+    // Deliveries may start before this returns; they only use the sink's
+    // address, which moving the unique_ptr below does not change.
+    LrmMidiIn* midi_in = lrm_midi_in_open_by_id(
+        observer, port_id, post_midi_to_port, sink.get(),
+        receive_sysex, receive_timing, receive_sensing);
+    if (midi_in) midi_in->port_sink = std::move(sink);
+    return midi_in;
+}
+
+// Apple platforms report no reason for a failed open (see lrm_get_last_error);
+// these keep the shared asynchronous-open code identical to the other copy.
+struct OpenErrorScope {
+    OpenErrorScope() {}  // user-provided, like the other copy's: no unused-variable noise
+    void set(const char*) {}
+};
+
+static std::string current_open_error() {
+    return {};
+}
+
+// Resolve a port id against the observer for the asynchronous open.
+static bool resolve_input_port(LrmObserver* observer, uint64_t port_id,
+                               libremidi::input_port& port) {
+    return observer->state->getInputPortById(port_id, port);
+}
+
+static bool resolve_output_port(LrmObserver* observer, uint64_t port_id,
+                                libremidi::output_port& port) {
+    return observer->state->getOutputPortById(port_id, port);
+}
+
+// =============================================================================
+// Asynchronous open
+// =============================================================================
+//
+// See the header. The ticket outlives whichever side finishes first: the
+// opening thread posts "done" and drops its share; the caller takes the handle
+// and drops its share — or, if its isolate ended, its NativeFinalizer drops it.
+// The last share closes a handle nobody took. Must stay in sync with the other
+// native copy; the copy-specific parts are resolve_*_port and the open-error
+// helpers above.
+struct LrmOpenTicket {
+    explicit LrmOpenTicket(bool input) : is_input(input) {}
+    const bool is_input;
+    std::atomic<int> owners{2};  // the opening thread and the caller
+    std::mutex mutex;            // guards handle and error
+    void* handle = nullptr;      // LrmMidiIn* / LrmMidiOut* until taken
+    std::string error;
+};
+
+static void close_open_handle(bool is_input, void* handle) {
+    if (!handle) return;
+    if (is_input) delete static_cast<LrmMidiIn*>(handle);
+    else delete static_cast<LrmMidiOut*>(handle);
+}
+
+static void release_open_ticket(LrmOpenTicket* ticket) {
+    if (ticket->owners.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    close_open_handle(ticket->is_input, ticket->handle);
+    delete ticket;
+}
+
+// Runs on the opening thread once the open has finished either way.
+static void finish_open(LrmOpenTicket* ticket, void* handle, LrmPostCObject post,
+                        int64_t done_port) {
+    {
+        std::lock_guard<std::mutex> lock(ticket->mutex);
+        ticket->handle = handle;
+        if (!handle) {
+            ticket->error = current_open_error();
+            if (ticket->error.empty()) ticket->error = "open failed";
+        }
+    }
+    Dart_CObject done;
+    done.type = Dart_CObject_kNull;
+    post(done_port, &done);  // false if the caller's isolate is gone; its
+                             // finalizer then releases the other share
+    release_open_ticket(ticket);
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmOpenTicket* lrm_midi_in_open_by_id_async(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t message_port,
+    int64_t done_port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+) {
+    if (!observer || !post) return nullptr;
+    OpenErrorScope open_error;
+    libremidi::input_port port;
+    if (!resolve_input_port(observer, port_id, port)) {
+        open_error.set("port not found, the device may have been disconnected");
+        return nullptr;
+    }
+    LrmOpenTicket* ticket = nullptr;
+    try {
+        auto sink = std::make_unique<DartPortSink>(DartPortSink{post, message_port});
+        ticket = new LrmOpenTicket(true);
+        std::thread([ticket, port, sink = std::move(sink), post, done_port,
+                     receive_sysex, receive_timing, receive_sensing]() mutable {
+            OpenErrorScope thread_error;
+            LrmMidiIn* midi_in = nullptr;
+            try {
+                // As in lrm_midi_in_open_by_id_with_port: deliveries may start
+                // before the sink is handed over; they only use its address.
+                midi_in = new LrmMidiIn(port, post_midi_to_port, sink.get(),
+                                        receive_sysex, receive_timing, receive_sensing);
+                midi_in->port_sink = std::move(sink);
+            } catch (...) {
+                midi_in = nullptr;
+            }
+            finish_open(ticket, midi_in, post, done_port);
+        }).detach();
+        return ticket;
+    } catch (...) {
+        delete ticket;
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT LrmOpenTicket* lrm_midi_out_open_by_id_async(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t done_port
+) {
+    if (!observer || !post) return nullptr;
+    OpenErrorScope open_error;
+    libremidi::output_port port;
+    if (!resolve_output_port(observer, port_id, port)) {
+        open_error.set("port not found, the device may have been disconnected");
+        return nullptr;
+    }
+    LrmOpenTicket* ticket = nullptr;
+    try {
+        ticket = new LrmOpenTicket(false);
+        std::thread([ticket, port, post, done_port]() mutable {
+            OpenErrorScope thread_error;
+            LrmMidiOut* midi_out = nullptr;
+            try {
+                midi_out = new LrmMidiOut(port);
+            } catch (...) {
+                midi_out = nullptr;
+            }
+            finish_open(ticket, midi_out, post, done_port);
+        }).detach();
+        return ticket;
+    } catch (...) {
+        delete ticket;
+        return nullptr;
+    }
+}
+
+extern "C" FFI_PLUGIN_EXPORT void* lrm_open_ticket_take(LrmOpenTicket* ticket) {
+    if (!ticket) return nullptr;
+    std::lock_guard<std::mutex> lock(ticket->mutex);
+    void* handle = ticket->handle;
+    ticket->handle = nullptr;
+    return handle;
+}
+
+extern "C" FFI_PLUGIN_EXPORT const char* lrm_open_ticket_error(LrmOpenTicket* ticket) {
+    if (!ticket) return "";
+    std::lock_guard<std::mutex> lock(ticket->mutex);
+    return ticket->error.c_str();
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket) {
+    if (ticket) release_open_ticket(ticket);
 }

@@ -61,7 +61,7 @@ android {
         // AMidi API requires API 29+.
         minSdk = 29
 
-        // Keeps the JNI callback classes alive in consumers' R8 builds.
+        // Keeps the classes native code reaches by name alive in consumers' R8 builds.
         consumerProguardFiles("consumer-rules.pro")
     }
 }

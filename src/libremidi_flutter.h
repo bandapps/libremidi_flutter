@@ -96,12 +96,21 @@ typedef void (*LrmHotplugCallback)(
     int32_t event_type
 );
 
+// Dart's Dart_PostCObject, as handed out by NativeApi.postCObject. `message`
+// is a Dart_CObject*. Used by the *_with_port functions below.
+typedef bool (*LrmPostCObject)(int64_t port, void* message);
+
 // =============================================================================
 // Library info
 // =============================================================================
 
 // Get library version string
 FFI_PLUGIN_EXPORT const char* lrm_get_version(void);
+
+// Why the last lrm_midi_in_open*/lrm_midi_out_open* call on this thread
+// returned NULL, or "" if there is no reason to give. Currently only Android
+// reports reasons. The string stays valid until the next open on this thread.
+FFI_PLUGIN_EXPORT const char* lrm_get_last_error(void);
 
 // Free a heap buffer that the library handed to the caller (e.g. the MIDI
 // message data delivered to LrmMidiCallback). Safe to call with NULL.
@@ -118,6 +127,18 @@ FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new(void);
 FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new_with_callbacks(
     LrmHotplugCallback callback,
     void* context
+);
+
+// Create a new observer that posts hotplug events to a Dart native port
+// (a ReceivePort's sendPort.nativePort) as an int (the event_type above).
+//
+// Prefer this over lrm_observer_new_with_callbacks from Dart: a NativeCallable
+// that has been closed — because its isolate ended or the app was hot
+// restarted without disposing the observer — aborts the process when invoked,
+// while posting to a closed port is simply dropped.
+FFI_PLUGIN_EXPORT LrmObserver* lrm_observer_new_with_port(
+    LrmPostCObject post,
+    int64_t port
 );
 
 // Free the observer
@@ -209,8 +230,68 @@ FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
     bool receive_sensing
 );
 
+// Open a MIDI input port by port_id, posting each message to a Dart native
+// port as a two-element array: [Uint8List bytes, int timestamp]. The bytes are
+// copied into the Dart heap by the post, so nothing has to be freed. See
+// lrm_observer_new_with_port for why this is preferable to a callback.
+FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id_with_port(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+);
+
 // Close and free a MIDI input
 FFI_PLUGIN_EXPORT void lrm_midi_in_close(LrmMidiIn* midi_in);
+
+// -----------------------------------------------------------------------------
+// Asynchronous open
+// -----------------------------------------------------------------------------
+//
+// The *_async functions resolve the port immediately (NULL if it is unknown,
+// see lrm_get_last_error) and open it on a native thread, which can take a
+// while on Android. When the open has finished, a null message is posted to
+// done_port. The result is held by the returned ticket: take it with
+// lrm_open_ticket_take, read a failure reason with lrm_open_ticket_error, then
+// release the ticket.
+//
+// The ticket has two owners, the opening thread and the caller, and whoever
+// releases it last closes a handle nobody took. A caller whose isolate ends
+// mid-open therefore only has to release the ticket (e.g. from a
+// NativeFinalizer) — the port is closed when the open finishes. The observer
+// is not used after the *_async call returns.
+typedef struct LrmOpenTicket LrmOpenTicket;
+
+FFI_PLUGIN_EXPORT LrmOpenTicket* lrm_midi_in_open_by_id_async(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t message_port,
+    int64_t done_port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing
+);
+
+FFI_PLUGIN_EXPORT LrmOpenTicket* lrm_midi_out_open_by_id_async(
+    LrmObserver* observer,
+    uint64_t port_id,
+    LrmPostCObject post,
+    int64_t done_port
+);
+
+// After the done message: the opened LrmMidiIn* / LrmMidiOut* (ownership
+// passes to the caller), or NULL if the open failed or it was already taken.
+FFI_PLUGIN_EXPORT void* lrm_open_ticket_take(LrmOpenTicket* ticket);
+
+// After the done message: why the open failed, or "". Valid until release.
+FFI_PLUGIN_EXPORT const char* lrm_open_ticket_error(LrmOpenTicket* ticket);
+
+// Gives up the caller's share of the ticket.
+FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket);
 
 // Check if input is connected
 FFI_PLUGIN_EXPORT bool lrm_midi_in_is_connected(LrmMidiIn* midi_in);

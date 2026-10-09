@@ -4,8 +4,9 @@ library;
 import 'dart:convert' show utf8;
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate' show RawReceivePort;
 import 'dart:typed_data';
-import 'dart:async' show Stream, StreamController;
+import 'dart:async' show Completer, Stream, StreamController;
 
 import 'package:ffi/ffi.dart';
 
@@ -36,6 +37,90 @@ final DynamicLibrary _dylib = () {
 }();
 
 final LibremidiFlutterBindings _bindings = LibremidiFlutterBindings(_dylib);
+
+/// Dart_PostCObject, for the native side to deliver to a [RawReceivePort].
+///
+/// Native code posts incoming MIDI and hotplug events to a port instead of
+/// calling a NativeCallable: when an isolate ends — or the app is hot
+/// restarted — with an input or observer still open, a post to its closed port
+/// is dropped, whereas calling a deleted NativeCallable aborts the process.
+final LrmPostCObject _postCObject = NativeApi.postCObject.cast();
+
+/// Why the last open on this thread failed; empty when the platform gives no
+/// reason (currently only Android does).
+String _lastOpenError() =>
+    _bindings.lrm_get_last_error().cast<Utf8>().toDartString();
+
+/// Builds the exception for a failed open, with the native reason appended.
+MidiException _openFailure(String what, [String? reason]) {
+  reason ??= _lastOpenError();
+  return MidiException(reason.isEmpty ? what : '$what: $reason');
+}
+
+// Native cleanup for objects whose owner never called dispose() — typically
+// because their isolate ended or the app was hot restarted. Each runs the
+// matching close/free once the Dart object has been garbage collected or the
+// isolate group shuts down; dispose() detaches it, so nothing is freed twice.
+// An input stays reachable through its receive port while that port is open,
+// so an input still in use is never finalized.
+NativeFinalizer _finalizerFor(String symbol) => NativeFinalizer(
+    _dylib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(symbol));
+final NativeFinalizer _observerFinalizer = _finalizerFor('lrm_observer_free');
+final NativeFinalizer _inputFinalizer = _finalizerFor('lrm_midi_in_close');
+final NativeFinalizer _outputFinalizer = _finalizerFor('lrm_midi_out_close');
+
+final NativeFinalizer _ticketFinalizer = _finalizerFor('lrm_open_ticket_release');
+
+/// The caller's share of a native asynchronous open (see `LrmOpenTicket` in
+/// the header). If the awaiting isolate ends before the open finishes, this
+/// object becomes unreachable and its finalizer gives up the share; the native
+/// side then closes the port once the open completes. Nothing else in the
+/// open uses the observer, so ending the isolate mid-open is safe.
+final class _OpenTicket implements Finalizable {
+  _OpenTicket(this._ticket) {
+    _ticketFinalizer.attach(this, _ticket.cast(), detach: this);
+  }
+
+  final Pointer<LrmOpenTicket> _ticket;
+
+  /// Takes the opened handle (null on failure) and the failure reason, and
+  /// releases the ticket. Call once, after the done message.
+  (Pointer<Void>, String) finish() {
+    final handle = _bindings.lrm_open_ticket_take(_ticket);
+    final error = _bindings.lrm_open_ticket_error(_ticket).cast<Utf8>().toDartString();
+    _ticketFinalizer.detach(this);
+    _bindings.lrm_open_ticket_release(_ticket);
+    return (handle, error);
+  }
+}
+
+/// Starts a native asynchronous open with [start] (given the native port to
+/// notify) and waits for it. [what] names the port kind for the exception.
+Future<Pointer<Void>> _openAsync(
+  String what,
+  Pointer<LrmOpenTicket> Function(int donePort) start,
+) async {
+  final done = Completer<void>();
+  final donePort =
+      RawReceivePort((_) => done.complete(), 'libremidi_flutter open');
+  final _OpenTicket ticket;
+  try {
+    final raw = start(donePort.sendPort.nativePort);
+    if (raw == nullptr) throw _openFailure(what);
+    ticket = _OpenTicket(raw);
+  } catch (_) {
+    donePort.close();
+    rethrow;
+  }
+  try {
+    await done.future;
+  } finally {
+    donePort.close();
+  }
+  final (handle, error) = ticket.finish();
+  if (handle == nullptr) throw _openFailure(what, error);
+  return handle;
+}
 
 // =============================================================================
 // MidiTransportType - Type of MIDI connection
@@ -633,10 +718,10 @@ enum HotplugEventType {
 // =============================================================================
 
 /// Observer for enumerating available MIDI ports.
-class MidiObserver {
+class MidiObserver implements Finalizable {
   Pointer<LrmObserver>? _handle;
   bool _disposed = false;
-  NativeCallable<Void Function(Pointer<Void>, Int32)>? _hotplugCallable;
+  RawReceivePort? _hotplugPort;
   final StreamController<HotplugEventType> _hotplugController =
       StreamController<HotplugEventType>.broadcast();
 
@@ -646,6 +731,7 @@ class MidiObserver {
     if (_handle == nullptr) {
       throw const MidiException('Failed to create MIDI observer');
     }
+    _observerFinalizer.attach(this, _handle!.cast(), detach: this);
   }
 
   /// Creates a new MIDI observer with hotplug detection.
@@ -658,24 +744,23 @@ class MidiObserver {
   /// and Windows the port lists are already populated when the constructor
   /// returns. See [onHotplug] for the full per-platform event contract.
   MidiObserver.withHotplug() {
-    _hotplugCallable =
-        NativeCallable<Void Function(Pointer<Void>, Int32)>.listener(
-      _onHotplugEvent,
-    );
+    final port = RawReceivePort(_onHotplugEvent, 'libremidi_flutter hotplug');
+    _hotplugPort = port;
 
-    _handle = _bindings.lrm_observer_new_with_callbacks(
-      _hotplugCallable!.nativeFunction,
-      nullptr,
+    _handle = _bindings.lrm_observer_new_with_port(
+      _postCObject,
+      port.sendPort.nativePort,
     );
 
     if (_handle == nullptr) {
-      _hotplugCallable?.close();
+      port.close();
       throw const MidiException('Failed to create MIDI observer');
     }
+    _observerFinalizer.attach(this, _handle!.cast(), detach: this);
   }
 
-  void _onHotplugEvent(Pointer<Void> context, int eventType) {
-    if (!_disposed) {
+  void _onHotplugEvent(Object? eventType) {
+    if (!_disposed && eventType is int) {
       _hotplugController.add(HotplugEventType.fromValue(eventType));
     }
   }
@@ -688,6 +773,8 @@ class MidiObserver {
   /// is correct and the first [HotplugEventType.setupChanged] still arrives,
   /// but no further event ever will, so an app that relies on hotplug should
   /// check this and fall back to polling [getInputPorts] / [getOutputPorts].
+  /// On Android it is also false when the device has no MIDI support, in which
+  /// case there are no ports either.
   ///
   /// On iOS/macOS this is false until the observer has finished initialising in
   /// the background — asking right after creating it always returns false.
@@ -792,6 +879,11 @@ class MidiObserver {
   ///
   /// The port is resolved by [MidiPort.portId], which is stable across
   /// hotplug events (unlike index-based lookup).
+  ///
+  /// Returns once the port is open, so it can be sent to right away; throws a
+  /// [MidiException] otherwise. On Android, opening a Bluetooth or virtual
+  /// device for the first time can take a moment while the system connects
+  /// it (at most 5 seconds before giving up).
   MidiOutput openOutput(MidiPort port) {
     _checkDisposed();
     if (port.isInput) {
@@ -807,6 +899,9 @@ class MidiObserver {
   ///
   /// By default, SysEx messages are received, while timing (MIDI clock) and
   /// active sensing messages are filtered out.
+  ///
+  /// Returns once the port is open; see [openOutput] for how long that can
+  /// take on Android.
   MidiInput openInput(
     MidiPort port, {
     bool receiveSysex = true,
@@ -824,6 +919,64 @@ class MidiObserver {
       receiveTiming: receiveTiming,
       receiveSensing: receiveSensing,
     );
+  }
+
+  /// Like [openOutput], but the port opens on a native thread while the
+  /// calling isolate keeps running. Worth using on Android, where the first
+  /// open of a Bluetooth or virtual device can take a moment; elsewhere
+  /// opening is quick either way.
+  ///
+  /// If the calling isolate ends before the open finishes, the port is closed
+  /// again as soon as it is open.
+  Future<MidiOutput> openOutputAsync(MidiPort port) async {
+    _checkDisposed();
+    if (port.isInput) {
+      throw ArgumentError('Port must be an output port');
+    }
+    final handle = await _openAsync(
+      'Failed to open MIDI output',
+      (donePort) => _bindings.lrm_midi_out_open_by_id_async(
+          _handle!, port.portId, _postCObject, donePort),
+    );
+    return MidiOutput._adopt(handle.cast());
+  }
+
+  /// Like [openInput], but the port opens on a native thread while the
+  /// calling isolate keeps running. See [openOutputAsync].
+  Future<MidiInput> openInputAsync(
+    MidiPort port, {
+    bool receiveSysex = true,
+    bool receiveTiming = false,
+    bool receiveSensing = false,
+  }) async {
+    _checkDisposed();
+    if (!port.isInput) {
+      throw ArgumentError('Port must be an input port');
+    }
+    // Created first: messages may arrive before the open has been reported,
+    // and they belong to this input.
+    final input = MidiInput._pending();
+    final Pointer<Void> handle;
+    try {
+      handle = await _openAsync(
+        'Failed to open MIDI input',
+        (donePort) => _bindings.lrm_midi_in_open_by_id_async(
+          _handle!,
+          port.portId,
+          _postCObject,
+          input._port!.sendPort.nativePort,
+          donePort,
+          receiveSysex,
+          receiveTiming,
+          receiveSensing,
+        ),
+      );
+    } catch (_) {
+      input.dispose();
+      rethrow;
+    }
+    input._adoptHandle(handle.cast());
+    return input;
   }
 
   /// Refreshes the internal port list cache.
@@ -855,19 +1008,22 @@ class MidiObserver {
   }
 
   /// Disposes the observer and releases resources.
+  ///
+  /// Inputs and outputs opened from it stay open; dispose them separately.
+  /// An async open already in progress is unaffected: it no longer uses the
+  /// observer once started.
   void dispose() {
-    if (!_disposed && _handle != null) {
-      // Order matters to avoid use-after-free:
-      // 1. Mark disposed first to reject new callbacks in Dart
-      _disposed = true;
-      // 2. Free native resources first (stops the native producer)
-      _bindings.lrm_observer_free(_handle!);
-      _handle = null;
-      // 3. Now safe to close the callable (no native code can call it)
-      _hotplugCallable?.close();
-      // 4. Close Dart stream controller
-      _hotplugController.close();
-    }
+    if (_disposed || _handle == null) return;
+    // 1. Mark disposed first to reject new events in Dart.
+    _disposed = true;
+    // 2. Free native resources (stops the native producer).
+    _observerFinalizer.detach(this);
+    _bindings.lrm_observer_free(_handle!);
+    _handle = null;
+    // 3. Close the port. Events already posted to it are dropped.
+    _hotplugPort?.close();
+    // 4. Close Dart stream controller
+    _hotplugController.close();
   }
 
   /// Helper to convert char array to String (UTF-8 safe).
@@ -1119,7 +1275,7 @@ class MidiMessageBuilder {
 // =============================================================================
 
 /// Handles MIDI output to a connected port.
-class MidiOutput {
+class MidiOutput implements Finalizable {
   Pointer<LrmMidiOut>? _handle;
   bool _disposed = false;
 
@@ -1128,10 +1284,20 @@ class MidiOutput {
   void Function()? _onDispose;
 
   MidiOutput._byId(Pointer<LrmObserver> observer, int portId) {
-    _handle = _bindings.lrm_midi_out_open_by_id(observer, portId);
-    if (_handle == nullptr) {
-      throw const MidiException('Failed to open MIDI output');
+    final handle = _bindings.lrm_midi_out_open_by_id(observer, portId);
+    if (handle == nullptr) {
+      throw _openFailure('Failed to open MIDI output');
     }
+    _adoptHandle(handle);
+  }
+
+  MidiOutput._adopt(Pointer<LrmMidiOut> handle) {
+    _adoptHandle(handle);
+  }
+
+  void _adoptHandle(Pointer<LrmMidiOut> handle) {
+    _handle = handle;
+    _outputFinalizer.attach(this, handle.cast(), detach: this);
   }
 
   /// The raw native pointer address for cross-plugin bridging.
@@ -1385,6 +1551,7 @@ class MidiOutput {
     if (_disposed) return;
     _disposed = true;
     if (_handle != null) {
+      _outputFinalizer.detach(this);
       _bindings.lrm_midi_out_close(_handle!);
       _handle = null;
     }
@@ -1403,11 +1570,10 @@ class MidiOutput {
 // =============================================================================
 
 /// Handles MIDI input from a connected port.
-class MidiInput {
+class MidiInput implements Finalizable {
   Pointer<LrmMidiIn>? _handle;
   bool _disposed = false;
-  NativeCallable<Void Function(Pointer<Void>, Pointer<Uint8>, Size, Int64)>?
-      _callback;
+  RawReceivePort? _port;
   final StreamController<MidiMessage> _messageController =
       StreamController<MidiMessage>.broadcast();
 
@@ -1422,51 +1588,46 @@ class MidiInput {
     required bool receiveTiming,
     required bool receiveSensing,
   }) {
-    _callback = NativeCallable<
-        Void Function(Pointer<Void>, Pointer<Uint8>, Size,
-            Int64)>.listener(_onMidiMessage);
+    final port = RawReceivePort(_onMidiMessage, 'libremidi_flutter input');
+    _port = port;
 
-    _handle = _bindings.lrm_midi_in_open_by_id(
+    final handle = _bindings.lrm_midi_in_open_by_id_with_port(
       observer,
       portId,
-      _callback!.nativeFunction,
-      nullptr,
+      _postCObject,
+      port.sendPort.nativePort,
       receiveSysex,
       receiveTiming,
       receiveSensing,
     );
 
-    if (_handle == nullptr) {
-      _callback?.close();
-      throw const MidiException('Failed to open MIDI input');
+    if (handle == nullptr) {
+      // Read the reason before anything else can open on this thread.
+      final error = _openFailure('Failed to open MIDI input');
+      port.close();
+      throw error;
     }
+    _adoptHandle(handle);
   }
 
-  void _onMidiMessage(
-    Pointer<Void> context,
-    Pointer<Uint8> data,
-    int length,
-    int timestamp,
-  ) {
-    // [data] is an owning heap copy allocated by the native callback (the
-    // libremidi message buffer itself is reused and would be overwritten before
-    // this listener runs on the event loop). Copy it out, then release it via
-    // lrm_free — this happens even after dispose, so a message that still
-    // reaches this listener during teardown does not leak.
-    //
-    // Invocations that are still queued when dispose() calls
-    // NativeCallable.close() are dropped by the runtime and never reach this
-    // method. The native side therefore owns these buffers and reclaims
-    // whatever is still outstanding when the input closes; lrm_free ignores a
-    // pointer that was already reclaimed, so a late delivery cannot double
-    // free.
-    final bytes = Uint8List(length);
-    if (length > 0) {
-      bytes.setAll(0, data.asTypedList(length));
-    }
-    _bindings.lrm_free(data.cast<Void>());
+  /// An input whose native side is still being opened elsewhere; see
+  /// [MidiObserver.openInputAsync].
+  MidiInput._pending() {
+    _port = RawReceivePort(_onMidiMessage, 'libremidi_flutter input');
+  }
 
-    if (_disposed) return;
+  void _adoptHandle(Pointer<LrmMidiIn> handle) {
+    _handle = handle;
+    _inputFinalizer.attach(this, handle.cast(), detach: this);
+  }
+
+  /// Receives `[Uint8List bytes, int timestamp]`, posted by the native side.
+  /// The bytes were copied into this isolate by the post and are owned here.
+  void _onMidiMessage(Object? message) {
+    if (_disposed || message is! List || message.length != 2) return;
+    final bytes = message[0];
+    final timestamp = message[1];
+    if (bytes is! Uint8List || timestamp is! int) return;
     _messageController.add(MidiMessage(bytes, timestamp: timestamp));
   }
 
@@ -1538,11 +1699,12 @@ class MidiInput {
     // 2. Close the native MIDI input first. This stops the native producer and
     //    waits for a delivery that is already inside the native callback.
     if (_handle != null) {
+      _inputFinalizer.detach(this);
       _bindings.lrm_midi_in_close(_handle!);
       _handle = null;
     }
-    // 3. Now safe to close the callable (no native code can call it)
-    _callback?.close();
+    // 3. Close the port. Messages already posted to it are dropped.
+    _port?.close();
     // 4. Close Dart stream controller
     _messageController.close();
     // 5. Tell the LibremidiFlutter registry (if this input came from there)
@@ -1564,6 +1726,17 @@ class LibremidiFlutter {
   static MidiObserver? _observer;
   static final Map<int, MidiInput> _openInputs = {}; // portId -> MidiInput
   static final Map<int, MidiOutput> _openOutputs = {}; // portId -> MidiOutput
+  // Ports with an async open in flight, so a second open is refused as for an
+  // open port instead of racing the first.
+  static final Set<int> _openingInputs = {};
+  static final Set<int> _openingOutputs = {};
+  // Bumped by dispose(). An async open that started under an older generation
+  // must not register its port when it completes: dispose() promised that
+  // everything is released.
+  static int _generation = 0;
+
+  static StateError _disposedWhileOpening() => StateError(
+      'LibremidiFlutter was disposed while the port was opening');
 
   LibremidiFlutter._();
 
@@ -1612,7 +1785,8 @@ class LibremidiFlutter {
   ///
   /// Throws [StateError] if the port is already open.
   static MidiOutput openOutput(MidiPort port) {
-    if (_openOutputs.containsKey(port.portId)) {
+    if (_openOutputs.containsKey(port.portId) ||
+        _openingOutputs.contains(port.portId)) {
       throw StateError('Output port ${port.displayName} is already open');
     }
     final output = _ensureObserver.openOutput(port);
@@ -1635,7 +1809,8 @@ class LibremidiFlutter {
     bool receiveTiming = false,
     bool receiveSensing = false,
   }) {
-    if (_openInputs.containsKey(port.portId)) {
+    if (_openInputs.containsKey(port.portId) ||
+        _openingInputs.contains(port.portId)) {
       throw StateError('Input port ${port.displayName} is already open');
     }
     final input = _ensureObserver.openInput(
@@ -1648,6 +1823,67 @@ class LibremidiFlutter {
     // Keep the registry in sync even when the caller disposes the input
     // directly instead of going through disconnectInput().
     input._onDispose = () => _openInputs.remove(port.portId);
+    return input;
+  }
+
+  /// Like [openOutput], but keeps the calling isolate responsive while the
+  /// port opens. See [MidiObserver.openOutputAsync].
+  ///
+  /// Completes with a [StateError] if [dispose] runs before the port has
+  /// opened; the port is closed again in that case.
+  static Future<MidiOutput> openOutputAsync(MidiPort port) async {
+    final id = port.portId;
+    if (_openOutputs.containsKey(id) || _openingOutputs.contains(id)) {
+      throw StateError('Output port ${port.displayName} is already open');
+    }
+    final generation = _generation;
+    _openingOutputs.add(id);
+    final MidiOutput output;
+    try {
+      output = await _ensureObserver.openOutputAsync(port);
+    } finally {
+      if (generation == _generation) _openingOutputs.remove(id);
+    }
+    if (generation != _generation) {
+      output.dispose();
+      throw _disposedWhileOpening();
+    }
+    _openOutputs[id] = output;
+    output._onDispose = () => _openOutputs.remove(id);
+    return output;
+  }
+
+  /// Like [openInput], but keeps the calling isolate responsive while the
+  /// port opens. See [MidiObserver.openOutputAsync] and [openOutputAsync].
+  static Future<MidiInput> openInputAsync(
+    MidiPort port, {
+    bool receiveSysex = true,
+    bool receiveTiming = false,
+    bool receiveSensing = false,
+  }) async {
+    final id = port.portId;
+    if (_openInputs.containsKey(id) || _openingInputs.contains(id)) {
+      throw StateError('Input port ${port.displayName} is already open');
+    }
+    final generation = _generation;
+    _openingInputs.add(id);
+    final MidiInput input;
+    try {
+      input = await _ensureObserver.openInputAsync(
+        port,
+        receiveSysex: receiveSysex,
+        receiveTiming: receiveTiming,
+        receiveSensing: receiveSensing,
+      );
+    } finally {
+      if (generation == _generation) _openingInputs.remove(id);
+    }
+    if (generation != _generation) {
+      input.dispose();
+      throw _disposedWhileOpening();
+    }
+    _openInputs[id] = input;
+    input._onDispose = () => _openInputs.remove(id);
     return input;
   }
 
@@ -1692,7 +1928,13 @@ class LibremidiFlutter {
   /// This method is idempotent - calling it multiple times is safe.
   /// After disposal, [isInitialized] returns false and the library can
   /// be used again (a new observer will be created on next API call).
+  ///
+  /// Async opens still in progress are abandoned: their ports are closed as
+  /// soon as they open, and their futures complete with a [StateError].
   static void dispose() {
+    _generation++;
+    _openingInputs.clear();
+    _openingOutputs.clear();
     disconnectAll();
     _observer?.dispose();
     _observer = null;

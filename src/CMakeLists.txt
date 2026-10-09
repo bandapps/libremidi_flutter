@@ -196,22 +196,19 @@ if(ANDROID)
     LIBREMIDI_NO_WINMM=1
   )
 
-  # Add JNI shim and patched libremidi helpers (uses cached ClassLoader)
+  # JNI bridge to the Java side (dev.celtera.libremidi.MidiBridge), which the
+  # Android backend headers in src/libremidi/backends/android/ build on.
   target_sources(libremidi_flutter PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/jni_shim.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/android_helpers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/android_bridge.cpp"
   )
 
-  # Link AMidi and other Android libraries
+  # AMidi for the data path, log for diagnostics. The JavaVM comes from
+  # JNI_OnLoad, so nothing else (libnativehelper, libdl) is needed.
   find_library(ANDROID_LOG_LIB log)
   find_library(ANDROID_AMIDI_LIB amidi)
-  find_library(ANDROID_LIB android)
-  find_library(ANDROID_DL_LIB dl)
   target_link_libraries(libremidi_flutter PRIVATE
     ${ANDROID_AMIDI_LIB}
     ${ANDROID_LOG_LIB}
-    ${ANDROID_LIB}
-    ${ANDROID_DL_LIB}
   )
 
   # Support Android 15 16k page size

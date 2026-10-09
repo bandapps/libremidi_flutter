@@ -75,6 +75,20 @@ class LibremidiFlutterBindings {
   late final _lrm_free =
       _lrm_freePtr.asFunction<void Function(ffi.Pointer<ffi.Void>)>();
 
+  /// Why the last lrm_midi_in_open*/lrm_midi_out_open* call on this thread
+  /// returned NULL, or "" if there is no reason to give. Currently only Android
+  /// reports reasons. The string stays valid until the next open on this thread.
+  ffi.Pointer<ffi.Char> lrm_get_last_error() {
+    return _lrm_get_last_error();
+  }
+
+  late final _lrm_get_last_errorPtr =
+      _lookup<ffi.NativeFunction<ffi.Pointer<ffi.Char> Function()>>(
+        'lrm_get_last_error',
+      );
+  late final _lrm_get_last_error =
+      _lrm_get_last_errorPtr.asFunction<ffi.Pointer<ffi.Char> Function()>();
+
   /// Get library version string
   ffi.Pointer<ffi.Char> lrm_get_version() {
     return _lrm_get_version();
@@ -212,6 +226,108 @@ class LibremidiFlutterBindings {
             )
           >();
 
+  ffi.Pointer<LrmOpenTicket> lrm_midi_in_open_by_id_async(
+    ffi.Pointer<LrmObserver> observer,
+    int port_id,
+    LrmPostCObject post,
+    int message_port,
+    int done_port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing,
+  ) {
+    return _lrm_midi_in_open_by_id_async(
+      observer,
+      port_id,
+      post,
+      message_port,
+      done_port,
+      receive_sysex,
+      receive_timing,
+      receive_sensing,
+    );
+  }
+
+  late final _lrm_midi_in_open_by_id_asyncPtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<LrmOpenTicket> Function(
+        ffi.Pointer<LrmObserver>,
+        ffi.Uint64,
+        LrmPostCObject,
+        ffi.Int64,
+        ffi.Int64,
+        ffi.Bool,
+        ffi.Bool,
+        ffi.Bool,
+      )
+    >
+  >('lrm_midi_in_open_by_id_async');
+  late final _lrm_midi_in_open_by_id_async =
+      _lrm_midi_in_open_by_id_asyncPtr
+          .asFunction<
+            ffi.Pointer<LrmOpenTicket> Function(
+              ffi.Pointer<LrmObserver>,
+              int,
+              LrmPostCObject,
+              int,
+              int,
+              bool,
+              bool,
+              bool,
+            )
+          >();
+
+  /// Open a MIDI input port by port_id, posting each message to a Dart native
+  /// port as a two-element array: [Uint8List bytes, int timestamp]. The bytes are
+  /// copied into the Dart heap by the post, so nothing has to be freed. See
+  /// lrm_observer_new_with_port for why this is preferable to a callback.
+  ffi.Pointer<LrmMidiIn> lrm_midi_in_open_by_id_with_port(
+    ffi.Pointer<LrmObserver> observer,
+    int port_id,
+    LrmPostCObject post,
+    int port,
+    bool receive_sysex,
+    bool receive_timing,
+    bool receive_sensing,
+  ) {
+    return _lrm_midi_in_open_by_id_with_port(
+      observer,
+      port_id,
+      post,
+      port,
+      receive_sysex,
+      receive_timing,
+      receive_sensing,
+    );
+  }
+
+  late final _lrm_midi_in_open_by_id_with_portPtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<LrmMidiIn> Function(
+        ffi.Pointer<LrmObserver>,
+        ffi.Uint64,
+        LrmPostCObject,
+        ffi.Int64,
+        ffi.Bool,
+        ffi.Bool,
+        ffi.Bool,
+      )
+    >
+  >('lrm_midi_in_open_by_id_with_port');
+  late final _lrm_midi_in_open_by_id_with_port =
+      _lrm_midi_in_open_by_id_with_portPtr
+          .asFunction<
+            ffi.Pointer<LrmMidiIn> Function(
+              ffi.Pointer<LrmObserver>,
+              int,
+              LrmPostCObject,
+              int,
+              bool,
+              bool,
+              bool,
+            )
+          >();
+
   /// Close and free a MIDI output
   void lrm_midi_out_close(ffi.Pointer<LrmMidiOut> midi_out) {
     return _lrm_midi_out_close(midi_out);
@@ -274,6 +390,36 @@ class LibremidiFlutterBindings {
       _lrm_midi_out_open_by_idPtr
           .asFunction<
             ffi.Pointer<LrmMidiOut> Function(ffi.Pointer<LrmObserver>, int)
+          >();
+
+  ffi.Pointer<LrmOpenTicket> lrm_midi_out_open_by_id_async(
+    ffi.Pointer<LrmObserver> observer,
+    int port_id,
+    LrmPostCObject post,
+    int done_port,
+  ) {
+    return _lrm_midi_out_open_by_id_async(observer, port_id, post, done_port);
+  }
+
+  late final _lrm_midi_out_open_by_id_asyncPtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<LrmOpenTicket> Function(
+        ffi.Pointer<LrmObserver>,
+        ffi.Uint64,
+        LrmPostCObject,
+        ffi.Int64,
+      )
+    >
+  >('lrm_midi_out_open_by_id_async');
+  late final _lrm_midi_out_open_by_id_async =
+      _lrm_midi_out_open_by_id_asyncPtr
+          .asFunction<
+            ffi.Pointer<LrmOpenTicket> Function(
+              ffi.Pointer<LrmObserver>,
+              int,
+              LrmPostCObject,
+              int,
+            )
           >();
 
   /// Send a MIDI message
@@ -395,7 +541,7 @@ class LibremidiFlutterBindings {
       _lrm_observer_get_output_countPtr
           .asFunction<int Function(ffi.Pointer<LrmObserver>)>();
 
-  /// Whether this observer can actually deliver hotplug events.
+  /// Whether this observer can actually deliver hotplug events *right now*.
   ///
   /// Returns false for an observer created without a hotplug callback, and — on
   /// iOS/macOS — also when the CoreMIDI notification client could not be created
@@ -403,6 +549,12 @@ class LibremidiFlutterBindings {
   /// enumeration still works in that case, so the failure is otherwise invisible:
   /// the port list is correct and the initial setup_changed event still arrives,
   /// but no further hotplug notification ever will.
+  ///
+  /// On iOS/macOS this is false until the observer's background initialisation
+  /// has finished, so a caller asking immediately after creating the observer
+  /// gets false. Check it again once the first setup_changed event has arrived:
+  /// that event is emitted right after the notification client is set up, so by
+  /// then the answer is final.
   bool lrm_observer_hotplug_available(ffi.Pointer<LrmObserver> observer) {
     return _lrm_observer_hotplug_available(observer);
   }
@@ -452,6 +604,29 @@ class LibremidiFlutterBindings {
             )
           >();
 
+  /// Create a new observer that posts hotplug events to a Dart native port
+  /// (a ReceivePort's sendPort.nativePort) as an int (the event_type above).
+  ///
+  /// Prefer this over lrm_observer_new_with_callbacks from Dart: a NativeCallable
+  /// that has been closed — because its isolate ended or the app was hot
+  /// restarted without disposing the observer — aborts the process when invoked,
+  /// while posting to a closed port is simply dropped.
+  ffi.Pointer<LrmObserver> lrm_observer_new_with_port(
+    LrmPostCObject post,
+    int port,
+  ) {
+    return _lrm_observer_new_with_port(post, port);
+  }
+
+  late final _lrm_observer_new_with_portPtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<LrmObserver> Function(LrmPostCObject, ffi.Int64)
+    >
+  >('lrm_observer_new_with_port');
+  late final _lrm_observer_new_with_port =
+      _lrm_observer_new_with_portPtr
+          .asFunction<ffi.Pointer<LrmObserver> Function(LrmPostCObject, int)>();
+
   /// Refresh port list
   void lrm_observer_refresh(ffi.Pointer<LrmObserver> observer) {
     return _lrm_observer_refresh(observer);
@@ -464,6 +639,55 @@ class LibremidiFlutterBindings {
   late final _lrm_observer_refresh =
       _lrm_observer_refreshPtr
           .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
+
+  /// After the done message: why the open failed, or "". Valid until release.
+  ffi.Pointer<ffi.Char> lrm_open_ticket_error(
+    ffi.Pointer<LrmOpenTicket> ticket,
+  ) {
+    return _lrm_open_ticket_error(ticket);
+  }
+
+  late final _lrm_open_ticket_errorPtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<ffi.Char> Function(ffi.Pointer<LrmOpenTicket>)
+    >
+  >('lrm_open_ticket_error');
+  late final _lrm_open_ticket_error =
+      _lrm_open_ticket_errorPtr
+          .asFunction<
+            ffi.Pointer<ffi.Char> Function(ffi.Pointer<LrmOpenTicket>)
+          >();
+
+  /// Gives up the caller's share of the ticket.
+  void lrm_open_ticket_release(ffi.Pointer<LrmOpenTicket> ticket) {
+    return _lrm_open_ticket_release(ticket);
+  }
+
+  late final _lrm_open_ticket_releasePtr = _lookup<
+    ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmOpenTicket>)>
+  >('lrm_open_ticket_release');
+  late final _lrm_open_ticket_release =
+      _lrm_open_ticket_releasePtr
+          .asFunction<void Function(ffi.Pointer<LrmOpenTicket>)>();
+
+  /// After the done message: the opened LrmMidiIn* / LrmMidiOut* (ownership
+  /// passes to the caller), or NULL if the open failed or it was already taken.
+  ffi.Pointer<ffi.Void> lrm_open_ticket_take(
+    ffi.Pointer<LrmOpenTicket> ticket,
+  ) {
+    return _lrm_open_ticket_take(ticket);
+  }
+
+  late final _lrm_open_ticket_takePtr = _lookup<
+    ffi.NativeFunction<
+      ffi.Pointer<ffi.Void> Function(ffi.Pointer<LrmOpenTicket>)
+    >
+  >('lrm_open_ticket_take');
+  late final _lrm_open_ticket_take =
+      _lrm_open_ticket_takePtr
+          .asFunction<
+            ffi.Pointer<ffi.Void> Function(ffi.Pointer<LrmOpenTicket>)
+          >();
 }
 
 const int LRM_ERR_INIT_FAILED = -5;
@@ -528,6 +752,8 @@ final class LrmMidiOut extends ffi.Opaque {}
 
 final class LrmObserver extends ffi.Opaque {}
 
+final class LrmOpenTicket extends ffi.Opaque {}
+
 final class LrmPortInfo extends ffi.Struct {
   /// Cross-platform stable ID (survives hotplug/reorder)
   @ffi.Uint64()
@@ -581,3 +807,12 @@ final class LrmPortInfo extends ffi.Struct {
   @ffi.Bool()
   external bool is_virtual;
 }
+
+/// Dart's Dart_PostCObject, as handed out by NativeApi.postCObject. `message`
+/// is a Dart_CObject*. Used by the *_with_port functions below.
+typedef LrmPostCObject =
+    ffi.Pointer<ffi.NativeFunction<LrmPostCObjectFunction>>;
+typedef LrmPostCObjectFunction =
+    ffi.Bool Function(ffi.Int64 port, ffi.Pointer<ffi.Void> message);
+typedef DartLrmPostCObjectFunction =
+    bool Function(int port, ffi.Pointer<ffi.Void> message);

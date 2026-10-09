@@ -28,10 +28,10 @@ void main() {
     }
     final source = file.readAsStringSync();
 
-    const startMarker = 'class MidiOutput {';
-    const endMarker = 'class MidiInput {';
-    final start = source.indexOf(startMarker);
-    final end = source.indexOf(endMarker);
+    // Match the declarations by name, not by their exact line: the classes
+    // gained `implements Finalizable`, which broke a literal 'class X {'.
+    final start = source.indexOf(RegExp(r'^class MidiOutput\b', multiLine: true));
+    final end = source.indexOf(RegExp(r'^class MidiInput\b', multiLine: true));
     expect(start, greaterThan(-1), reason: 'class MidiOutput not found');
     expect(end, greaterThan(start),
         reason: 'class MidiInput not found after MidiOutput — the slice below '

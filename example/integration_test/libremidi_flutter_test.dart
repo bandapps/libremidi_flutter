@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
@@ -388,6 +390,175 @@ void main() {
       } finally {
         observer.dispose();
       }
+    });
+
+    // Locks the delivery path end to end: bytes and timestamp sent to a
+    // loopback reach `messages` intact. Without it, a break in how native code
+    // posts to Dart (port, message layout, buffer ownership) only shows up on
+    // a device. Needs a virtual port pair that echoes — the macOS IAC bus, or
+    // a loopback MidiDeviceService app on Android — and is skipped otherwise.
+    testWidgets('a message sent to a loopback arrives intact', (tester) async {
+      final observer = MidiObserver();
+      try {
+        MidiPort? inPort;
+        MidiPort? outPort;
+        for (final i in observer.getInputPorts().where((p) => p.isVirtual)) {
+          for (final o in observer.getOutputPorts().where((p) => p.isVirtual)) {
+            if (o.displayName == i.displayName) {
+              inPort = i;
+              outPort = o;
+            }
+          }
+        }
+        if (inPort == null || outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        final input = observer.openInput(inPort);
+        final output = observer.openOutput(outPort);
+        final received = <MidiMessage>[];
+        final sub = input.messages.listen(received.add);
+        try {
+          final sysex = MidiMessageBuilder.sysEx(
+            Uint8List.fromList([0x7D, for (var i = 0; i < 300; i++) i & 0x7F]),
+          );
+          output.send(MidiMessageBuilder.noteOn(channel: 2, note: 61, velocity: 99));
+          output.send(sysex);
+          for (var i = 0; i < 40 && received.length < 2; i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 50)),
+            );
+          }
+          final note = received.where((m) => m.isNoteOn).toList();
+          expect(note, hasLength(1));
+          expect([note.single.channel, note.single.note, note.single.velocity],
+              [2, 61, 99]);
+          expect(note.single.timestamp, isNonZero);
+          final dump = received.where((m) => m.isSysEx).toList();
+          expect(dump, hasLength(1));
+          expect(dump.single.data, sysex);
+        } finally {
+          await sub.cancel();
+          input.dispose();
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    // openInputAsync/openOutputAsync open on a helper isolate and hand the
+    // ports back to this one; without this test a break in that hand-over
+    // (wrong isolate owning the port, handle not adopted) would only show up
+    // in an app. Same loopback requirement as above.
+    testWidgets('ports opened asynchronously carry messages', (tester) async {
+      final observer = MidiObserver();
+      try {
+        MidiPort? inPort;
+        MidiPort? outPort;
+        for (final i in observer.getInputPorts().where((p) => p.isVirtual)) {
+          for (final o in observer.getOutputPorts().where((p) => p.isVirtual)) {
+            if (o.displayName == i.displayName) {
+              inPort = i;
+              outPort = o;
+            }
+          }
+        }
+        if (inPort == null || outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        late final MidiInput input;
+        late final MidiOutput output;
+        await tester.runAsync(() async {
+          input = await observer.openInputAsync(inPort!);
+          output = await observer.openOutputAsync(outPort!);
+        });
+        final received = <MidiMessage>[];
+        final sub = input.messages.listen(received.add);
+        try {
+          expect(input.isConnected, isTrue);
+          expect(output.isConnected, isTrue);
+          output.send(MidiMessageBuilder.noteOn(channel: 4, note: 72, velocity: 5));
+          for (var i = 0; i < 40 && received.isEmpty; i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 50)),
+            );
+          }
+          expect(received.where((m) => m.isNoteOn && m.note == 72 && m.channel == 4),
+              hasLength(1));
+        } finally {
+          await sub.cancel();
+          input.dispose();
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    // LibremidiFlutter.dispose() promises to release everything. Without the
+    // generation check, an async open that completes after it registered its
+    // port anyway, leaving a connection nobody can reach to close.
+    testWidgets('dispose during an async open releases the port', (
+      tester,
+    ) async {
+      MidiPort? inPort;
+      MidiPort? outPort;
+      // LibremidiFlutter's observer is a hotplug one, which on iOS/macOS fills
+      // its port list in the background; give it a moment.
+      for (var attempt = 0; attempt < 40 && inPort == null; attempt++) {
+        for (final i in LibremidiFlutter.getInputPorts().where((p) => p.isVirtual)) {
+          for (final o in LibremidiFlutter.getOutputPorts().where((p) => p.isVirtual)) {
+            if (o.displayName == i.displayName) {
+              inPort = i;
+              outPort = o;
+            }
+          }
+        }
+        if (inPort == null) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 50)),
+          );
+        }
+      }
+      if (inPort == null || outPort == null) {
+        LibremidiFlutter.dispose();
+        markTestSkipped('no virtual loopback port pair available');
+        return;
+      }
+
+      await tester.runAsync(() async {
+        final inputF = LibremidiFlutter.openInputAsync(inPort!);
+        final outputF = LibremidiFlutter.openOutputAsync(outPort!);
+        LibremidiFlutter.dispose();
+        await expectLater(inputF, throwsStateError);
+        await expectLater(outputF, throwsStateError);
+      });
+      expect(LibremidiFlutter.openInputCount, 0);
+      expect(LibremidiFlutter.openOutputCount, 0);
+
+      // Nothing stale blocks the ports: they open again normally. The fresh
+      // observer behind LibremidiFlutter lists them asynchronously on
+      // iOS/macOS, so wait for the input to reappear first.
+      for (var attempt = 0;
+          attempt < 40 &&
+              !LibremidiFlutter.getInputPorts()
+                  .any((p) => p.portId == inPort!.portId);
+          attempt++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+      }
+      final input = LibremidiFlutter.openInput(inPort);
+      final output = LibremidiFlutter.openOutput(outPort);
+      expect(LibremidiFlutter.openInputCount, 1);
+      expect(LibremidiFlutter.openOutputCount, 1);
+      input.dispose();
+      output.dispose();
+      LibremidiFlutter.dispose();
     });
 
     testWidgets('open and dispose without listening does not crash', (

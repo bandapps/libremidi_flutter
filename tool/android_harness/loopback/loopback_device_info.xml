@@ -1,0 +1,6 @@
+<devices>
+    <device manufacturer="Test" product="Loopback">
+        <input-port name="LoopIn" />
+        <output-port name="LoopOut" />
+    </device>
+</devices>
