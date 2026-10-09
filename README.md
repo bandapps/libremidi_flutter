@@ -1,10 +1,6 @@
 # libremidi_flutter
 
-A Flutter wrapper around [libremidi](https://github.com/jcelerier/libremidi), providing cross-platform MIDI device access.
-
-This is not a full-featured MIDI framework, but a stable and predictable wrapper for common control-oriented workflows.
-
-**Supports iOS, Android, macOS, Windows, Linux.**
+MIDI input and output for Flutter apps — device discovery and hotplug detection.
 
 ## Features
 
@@ -12,8 +8,7 @@ This is not a full-featured MIDI framework, but a stable and predictable wrapper
 - Hotplug detection (device connect/disconnect)
 - Common MIDI messages including CC, PC, Note On/Off, Pitch Bend, Aftertouch, SysEx, and RPN/NRPN
 - Device identification across reconnects
-- Device infos
-- Simple API for sending and receiving messages
+- Device details
 - Windows: prefers Windows MIDI Services (WinMIDI) when available, falls back to WinUWP
 
 ## Installation
@@ -31,7 +26,7 @@ import 'dart:typed_data';
 import 'package:libremidi_flutter/libremidi_flutter.dart';
 ```
 
-MIDI channels are zero-based in this package: channel `0` means MIDI channel 1, channel `15` means MIDI channel 16.
+MIDI channels are zero-based: channel `0` means MIDI channel 1, channel `15` means MIDI channel 16.
 
 ### Quick start
 
@@ -292,8 +287,8 @@ observer.dispose();
 
 ## Notes
 
+- **Bluetooth MIDI:** by design, this package ships no BLE stack of its own. BLE Pairing is handled by the operating system.
 - **Android BLE MIDI:** connecting to Bluetooth MIDI on Android 12+ requires the `BLUETOOTH_CONNECT` runtime permission. The plugin declares it in its manifest, but the app must request it at runtime (e.g. via `permission_handler`) before using BLE devices.
-- BLE MIDI requires native platform integration
 - See the bundled `example/` app for device selection, port selection, hotplug handling, MIDI input logs, and common output message types.
 
 ## License
