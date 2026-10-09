@@ -24,6 +24,7 @@
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
 #include <dart_api/dart_native_api.h>
+#include <lrm_transport.hpp>
 
 #include <atomic>
 #include <cstdio>
@@ -120,15 +121,14 @@ static uint64_t public_port_id(const PortType& port) {
         return fnv1a_hash(port.port_name);
     }
 
-    // Android: port.port packs MidiDeviceInfo.getId() with the port index, and
-    // Android assigns a new device id every time a device is reconnected — a
-    // saved id would stop matching, which is exactly what MidiPort.portId
-    // promises not to do. Hash the identifying strings instead. Android exposes no per-device
-    // unique id here, so two indistinguishable devices (same name and
-    // manufacturer, no serial) still collide; that is a limitation of the
-    // platform data, not of the encoding.
+    // Android: port.port packs MidiDeviceInfo.getId() with the port index.
+    // Android assigns that id per connection and never reuses it, so it tells
+    // two identical devices apart — hashing the descriptive strings did not,
+    // and opening the second of two identical controllers opened the first.
+    // A reconnected device gets a new id; recognising it again is what
+    // stableId / toMatchJson / findClosestPort are for.
     if (port.api == libremidi::API::ANDROID_AMIDI) {
-        return fnv1a_hash(port_key(port));
+        return static_cast<uint64_t>(port.port);
     }
 
     return static_cast<uint64_t>(port.port);
@@ -171,6 +171,12 @@ struct LrmObserver {
     // Set by lrm_observer_new_with_port: the context hotplug_callback posts to.
     std::unique_ptr<DartPortSink> port_sink;
     mutable std::mutex ports_mutex;  // Thread safety for port vectors
+    // Set by the backend's hotplug callbacks; the lists are rebuilt on the next
+    // read, on the reader's thread. The callbacks must not call into
+    // `observer` themselves: while ~LrmObserver tears it down, the backend
+    // waits for a running callback, and a callback that re-entered the
+    // half-destroyed observer crashed (reproduced on Android).
+    std::atomic<bool> ports_stale{false};
 
     LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
         : hotplug_callback(callback), hotplug_context(context)
@@ -183,19 +189,19 @@ struct LrmObserver {
 
         if (hotplug_callback) {
             config.input_added = [this](const libremidi::input_port&) {
-                refreshInternal();
+                ports_stale.store(true, std::memory_order_release);
                 notifyHotplug(LRM_EVENT_INPUT_ADDED);
             };
             config.input_removed = [this](const libremidi::input_port&) {
-                refreshInternal();
+                ports_stale.store(true, std::memory_order_release);
                 notifyHotplug(LRM_EVENT_INPUT_REMOVED);
             };
             config.output_added = [this](const libremidi::output_port&) {
-                refreshInternal();
+                ports_stale.store(true, std::memory_order_release);
                 notifyHotplug(LRM_EVENT_OUTPUT_ADDED);
             };
             config.output_removed = [this](const libremidi::output_port&) {
-                refreshInternal();
+                ports_stale.store(true, std::memory_order_release);
                 notifyHotplug(LRM_EVENT_OUTPUT_REMOVED);
             };
         }
@@ -212,22 +218,20 @@ struct LrmObserver {
     }
 
     ~LrmObserver() {
-        // Explicit teardown order. With the defaulted destructor, members were
-        // destroyed in reverse declaration order — ports_mutex and the port
-        // vectors went away *before* `observer`, which is declared first. The
-        // backend's hotplug thread can still be inside one of the configuration
-        // callbacks installed in the constructor at that moment, and those call
-        // refreshInternal(), i.e. they lock ports_mutex and assign the vectors.
-        // Destroying the observer first unregisters those callbacks and stops
-        // the backend thread while everything they touch is still alive.
+        // Destroy the observer first: the backend waits for a hotplug callback
+        // that is still running, and those callbacks touch ports_stale and the
+        // Dart delivery (hotplug_callback / port_sink) — so those must outlive
+        // it. With the defaulted destructor, members went in reverse
+        // declaration order, i.e. after everything the callbacks use. The
+        // callbacks never call back into `observer`, which unique_ptr::reset()
+        // already nulls before the backend's destructor runs.
         hotplug_callback.store(nullptr, std::memory_order_release);
         observer.reset();
     }
 
     template <typename PortType>
     static bool isInternalObserverPort(const PortType& port) {
-        if (port.type != libremidi::transport_type::software &&
-            port.type != libremidi::transport_type::loopback) {
+        if (!lrm_is_virtual_transport(port.type)) {
             return false;
         }
 
@@ -275,34 +279,45 @@ struct LrmObserver {
     }
 
     void refresh() {
+        ports_stale.store(false, std::memory_order_release);
         refreshInternal();
     }
 
-    size_t getInputCount() const {
+    void refreshIfStale() {
+        if (ports_stale.exchange(false, std::memory_order_acq_rel))
+            refreshInternal();
+    }
+
+    size_t getInputCount() {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         return input_ports.size();
     }
 
-    size_t getOutputCount() const {
+    size_t getOutputCount() {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         return output_ports.size();
     }
 
-    bool getInputPort(size_t index, libremidi::input_port& port) const {
+    bool getInputPort(size_t index, libremidi::input_port& port) {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         if (index >= input_ports.size()) return false;
         port = input_ports[index];
         return true;
     }
 
-    bool getOutputPort(size_t index, libremidi::output_port& port) const {
+    bool getOutputPort(size_t index, libremidi::output_port& port) {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         if (index >= output_ports.size()) return false;
         port = output_ports[index];
         return true;
     }
 
-    bool getInputPortById(uint64_t port_id, libremidi::input_port& port) const {
+    bool getInputPortById(uint64_t port_id, libremidi::input_port& port) {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         for (const auto& p : input_ports) {
             if (public_port_id(p) == port_id) {
@@ -313,7 +328,8 @@ struct LrmObserver {
         return false;
     }
 
-    bool getOutputPortById(uint64_t port_id, libremidi::output_port& port) const {
+    bool getOutputPortById(uint64_t port_id, libremidi::output_port& port) {
+        refreshIfStale();
         std::lock_guard<std::mutex> lock(ports_mutex);
         for (const auto& p : output_ports) {
             if (public_port_id(p) == port_id) {
@@ -673,8 +689,7 @@ static void fill_port_info(const PortType& port, int32_t index, bool is_input, L
     // Type info
     info->transport_type = static_cast<uint8_t>(port.type);
     info->is_input = is_input;
-    info->is_virtual = (port.type == libremidi::transport_type::software ||
-                        port.type == libremidi::transport_type::loopback);
+    info->is_virtual = lrm_is_virtual_transport(port.type);
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input(LrmObserver* observer, int32_t index, LrmPortInfo* info) {
@@ -730,8 +745,10 @@ static int32_t find_closest_port_impl(
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_find_closest_port(
     LrmObserver* observer, const LrmPortInfo* saved, bool is_input) {
     if (!observer || !saved) return -1;
-    // Hold ports_mutex for the whole match: hotplug refresh replaces these
-    // vectors under the same lock, so reading them unlocked would race with it.
+    // Rebuild a stale list first: refreshInternal() takes ports_mutex itself.
+    observer->refreshIfStale();
+    // Hold ports_mutex for the whole match: a refresh replaces these vectors
+    // under the same lock, so reading them unlocked would race with it.
     std::lock_guard<std::mutex> lock(observer->ports_mutex);
     if (is_input) {
         return find_closest_port_impl(observer->input_ports, saved);

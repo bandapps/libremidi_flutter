@@ -40,15 +40,29 @@ Future<void> sendWhenReady(MidiOutput out, Uint8List data) async {
 
 bool isLoop(MidiPort p) => p.displayName.startsWith('Loopback');
 
-Future<void> roundTrip(MidiObserver obs, String label) async {
-  final ins = obs.getInputPorts().where(isLoop).toList();
-  final outs = obs.getOutputPorts().where(isLoop).toList();
-  check(ins.isNotEmpty && outs.isNotEmpty,
-      '$label loopback ports listed (in=${ins.length} out=${outs.length})');
-  if (ins.isEmpty || outs.isEmpty) return;
+/// The device part of an Android port id (device id << 32 | port index).
+int deviceOf(MidiPort p) => p.portId >> 32;
 
-  final input = obs.openInput(ins.first);
-  final output = obs.openOutput(outs.first);
+/// An input and an output of the same loopback device. There are two
+/// identical loopback devices installed, so "the first of each" may pair
+/// different devices, and a message sent to one never echoes on the other.
+(MidiPort, MidiPort)? loopPair(MidiObserver o) {
+  final outs = o.getOutputPorts().where(isLoop).toList();
+  for (final i in o.getInputPorts().where(isLoop)) {
+    for (final out in outs) {
+      if (deviceOf(out) == deviceOf(i)) return (i, out);
+    }
+  }
+  return null;
+}
+
+Future<void> roundTrip(MidiObserver obs, String label) async {
+  final pair = loopPair(obs);
+  check(pair != null, '$label loopback ports listed');
+  if (pair == null) return;
+
+  final input = obs.openInput(pair.$1);
+  final output = obs.openOutput(pair.$2);
   final received = <MidiMessage>[];
   final sub = input.messages.listen(received.add);
 
@@ -86,12 +100,11 @@ Future<void> roundTrip(MidiObserver obs, String label) async {
 int openCloseCycles(MidiObserver o, int n) {
   var ok = 0;
   for (var i = 0; i < n; i++) {
-    final ins = o.getInputPorts().where(isLoop).toList();
-    final outs = o.getOutputPorts().where(isLoop).toList();
-    if (ins.isEmpty || outs.isEmpty) continue;
-    final input = o.openInput(ins.first);
+    final pair = loopPair(o);
+    if (pair == null) continue;
+    final input = o.openInput(pair.$1);
     try {
-      final output = o.openOutput(outs.first);
+      final output = o.openOutput(pair.$2);
       try {
         output.send(MidiMessageBuilder.noteOn(channel: 0, note: 1, velocity: 1));
         ok++;
@@ -130,6 +143,17 @@ int abandonAsyncOpens() {
   return 1;
 }
 
+/// Creates and disposes hotplug observers back to back for 75 s.
+int observerChurn() {
+  final end = DateTime.now().add(const Duration(seconds: 75));
+  var n = 0;
+  while (DateTime.now().isBefore(end)) {
+    MidiObserver.withHotplug().dispose();
+    n++;
+  }
+  return n;
+}
+
 int workerCycles() {
   final o = MidiObserver();
   try {
@@ -159,12 +183,11 @@ Future<void> run() async {
   // first, so the open has to bind it again.
   await guarded('async open', () async {
     await Future<void>.delayed(const Duration(seconds: 2));
-    final ins = obs.getInputPorts().where(isLoop).toList();
-    final outs = obs.getOutputPorts().where(isLoop).toList();
+    final pair = loopPair(obs)!;
     var ticks = 0;
     final timer = Timer.periodic(const Duration(milliseconds: 1), (_) => ticks++);
-    final inputF = obs.openInputAsync(ins.first);
-    final outputF = obs.openOutputAsync(outs.first);
+    final inputF = obs.openInputAsync(pair.$1);
+    final outputF = obs.openOutputAsync(pair.$2);
     final input = await inputF;
     final output = await outputF;
     timer.cancel();
@@ -178,6 +201,36 @@ Future<void> run() async {
     check(ticks > 0, 'async open kept the isolate running ($ticks ticks)');
     check(received.any((m) => m.isNoteOn && m.note == 70 && m.channel == 5),
         'async open round trip');
+  });
+
+  // Two identical devices (same name, manufacturer, product, no serial) must
+  // be told apart: distinct port ids, and a message sent to the second one
+  // arrives on the second one only.
+  await guarded('identical devices', () async {
+    final ins = obs.getInputPorts().where(isLoop).toList();
+    final outs = obs.getOutputPorts().where(isLoop).toList();
+    check(ins.length == 2 && outs.length == 2,
+        'two identical loopback devices listed (${ins.length}/${outs.length})');
+    if (ins.length != 2 || outs.length != 2) return;
+    check(ins[0].stableId == ins[1].stableId,
+        'the two devices are indistinguishable by their data');
+    check(ins[0].portId != ins[1].portId, 'identical devices have distinct port ids');
+    final inA = obs.openInput(ins[0]);
+    final inB = obs.openInput(ins[1]);
+    final outB = obs.openOutput(outs.firstWhere((o) => deviceOf(o) == deviceOf(ins[1])));
+    final gotA = <MidiMessage>[];
+    final gotB = <MidiMessage>[];
+    final subA = inA.messages.listen(gotA.add);
+    final subB = inB.messages.listen(gotB.add);
+    outB.send(MidiMessageBuilder.noteOn(channel: 9, note: 33, velocity: 3));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    await subA.cancel();
+    await subB.cancel();
+    inA.dispose();
+    inB.dispose();
+    outB.dispose();
+    check(gotB.any((m) => m.note == 33) && gotA.isEmpty,
+        'second identical device addressed on its own (A ${gotA.length}, B ${gotB.length})');
   });
 
   // Polling on the main thread within one event: local references created
@@ -243,9 +296,55 @@ Future<void> run() async {
   final held = obs.getInputPorts().where(isLoop).toList();
   final heldInput = held.isEmpty ? null : obs.openInput(held.first);
   hotplugEvents.clear();
+  // Observers are created and torn down without pause while devices come and
+  // go, here and on a worker isolate, so teardown keeps landing in the middle
+  // of a hotplug notification. And the visible loopback count is sampled: with
+  // one of the two identical devices removed it must drop to 1.
+  var minLoops = 99, maxLoops = 0, churned = 0;
+  var windowOpen = true;
+  final churnWorker = Isolate.run(observerChurn);
+  // The pattern apps use: on a hotplug event, throw the observer away and
+  // make a new one. The event for the input arrives while the native side is
+  // still delivering the output's change on the same observer.
+  var reactiveRecreated = 0;
+  late void Function() armReactive;
+  MidiObserver? reactive;
+  armReactive = () {
+    final o = MidiObserver.withHotplug();
+    reactive = o;
+    o.onHotplug.first.then((_) {
+      if (!windowOpen) return;
+      o.dispose();
+      reactiveRecreated++;
+      armReactive();
+    });
+  };
+  armReactive();
+  final sampler = () async {
+    while (windowOpen) {
+      obs.refresh();
+      final n = obs.getInputPorts().where(isLoop).length;
+      if (n < minLoops) minLoops = n;
+      if (n > maxLoops) maxLoops = n;
+      final churn = MidiObserver.withHotplug();
+      await Future<void>.delayed(Duration(milliseconds: churned % 20));
+      churn.dispose();
+      churned++;
+    }
+  }();
   log('HOTPLUG-WINDOW open for 75s');
   await Future<void>.delayed(const Duration(seconds: 75));
+  windowOpen = false;
+  await sampler;
+  final workerChurned = await churnWorker;
+  reactive?.dispose();
   heldInput?.dispose();
+  check(reactiveRecreated >= 5,
+      'observer disposed from its own hotplug event ($reactiveRecreated times)');
+  check(minLoops == 1 && maxLoops == 2,
+      'removing one of two identical devices is seen (loopbacks $minLoops..$maxLoops)');
+  check(churned > 100 && workerChurned > 100,
+      'observer teardown during hotplug ($churned here, $workerChurned on a worker)');
   final removals = hotplugEvents.where((e) => e == HotplugEventType.inputRemoved).length;
   final additions = hotplugEvents.where((e) => e == HotplugEventType.inputAdded).length;
   check(removals >= 5 && additions >= 5,
@@ -299,14 +398,14 @@ Future<void> run() async {
   await Future<void>.delayed(const Duration(seconds: 5));
 
   // Probe, deliberately last: an isolate that ends with an input still open.
-  await Isolate.run(() {
+  final orphanDevice = await Isolate.run(() {
     final o = MidiObserver();
-    final ins = o.getInputPorts().where(isLoop).toList();
-    if (ins.isNotEmpty) o.openInput(ins.first); // never disposed
-    return 0;
+    final pair = loopPair(o);
+    if (pair != null) o.openInput(pair.$1); // never disposed
+    return pair == null ? 0 : deviceOf(pair.$1);
   });
   log('ORPHAN isolate exited with an open input; sending into it');
-  final outs = obs.getOutputPorts().where(isLoop).toList();
+  final outs = obs.getOutputPorts().where((p) => isLoop(p) && deviceOf(p) == orphanDevice).toList();
   if (outs.isNotEmpty) {
     final out = obs.openOutput(outs.first);
     for (var i = 0; i < 20; i++) {

@@ -93,7 +93,11 @@ if(WIN32)
         RESULT_VARIABLE _cppwinrt_result
       )
 
-      if(_cppwinrt_result EQUAL 0)
+      # The WinMIDI backend needs the C++/WinRT projection generated above
+      # (winrt/Microsoft.Windows.Devices.Midi2.h); the bundled SDK only carries
+      # the COM extension header and init/, which are not enough to compile it.
+      if(_cppwinrt_result EQUAL 0
+         AND EXISTS "${CPPWINRT_OUTDIR}/winrt/Microsoft.Windows.Devices.Midi2.h")
         if(EXISTS "${WINMIDI_DIR}/build/native/include/winmidi/WindowsMidiServicesAppSdkComExtensions.h")
           file(COPY
             "${WINMIDI_DIR}/build/native/include/winmidi/init"
@@ -102,19 +106,21 @@ if(WIN32)
         endif()
         message(STATUS "libremidi_flutter: WinMIDI C++ projections generated successfully")
       else()
-        message(WARNING "libremidi_flutter: cppwinrt failed (${_cppwinrt_result}). Falling back to pre-packaged headers.")
-        file(COPY "${WINMIDI_DIR}/build/native/include/winmidi"
-             DESTINATION "${CPPWINRT_OUTDIR}/")
+        message(WARNING "libremidi_flutter: cppwinrt failed (${_cppwinrt_result}) — "
+                        "building without Windows MIDI Services, using WinUWP only.")
+        set(WINMIDI_AVAILABLE FALSE)
       endif()
     else()
-      message(STATUS "libremidi_flutter: cppwinrt not found — using pre-packaged WinMIDI headers")
-      file(COPY "${WINMIDI_DIR}/build/native/include/winmidi"
-           DESTINATION "${CPPWINRT_OUTDIR}/")
+      message(WARNING "libremidi_flutter: cppwinrt.exe not found in the Windows SDK — "
+                      "building without Windows MIDI Services, using WinUWP only.")
+      set(WINMIDI_AVAILABLE FALSE)
     endif()
 
-    target_include_directories(libremidi_flutter PRIVATE
-      "${CPPWINRT_OUTDIR}"
-    )
+    if(WINMIDI_AVAILABLE)
+      target_include_directories(libremidi_flutter PRIVATE
+        "${CPPWINRT_OUTDIR}"
+      )
+    endif()
   endif()
 
   if(WINMIDI_AVAILABLE)

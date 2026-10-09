@@ -4,6 +4,7 @@
 #
 #   build/midi_loopback  a MidiDeviceService with one port that echoes what is
 #                        sent to it — a virtual MIDI device, no hardware needed
+#   build/midi_loopback2 the same device again, indistinguishable by its data
 #   build/lrm_harness    a release (R8) build that drives libremidi_flutter
 #                        against that device and logs results to logcat
 #
@@ -18,16 +19,21 @@ OUT=$HERE/build
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-# --- loopback device ---------------------------------------------------------
-flutter create --platforms android --org dev.test --project-name midi_loopback \
-  "$OUT/midi_loopback" >/dev/null
-# flutter create's sample widget test targets the template app, which is gone.
-rm -rf "$OUT/midi_loopback/test"
-MAIN=$OUT/midi_loopback/android/app/src/main
-mkdir -p "$MAIN/java/dev/test/loopback" "$MAIN/res/xml"
-cp "$HERE/loopback/LoopbackService.java" "$MAIN/java/dev/test/loopback/"
-cp "$HERE/loopback/loopback_device_info.xml" "$MAIN/res/xml/"
-python3 - "$MAIN/AndroidManifest.xml" <<'EOF'
+# --- loopback devices ----------------------------------------------------------
+# Built twice under different package names but with identical device data
+# (same name, manufacturer and product, no serial): two indistinguishable
+# devices, as with two identical controllers.
+make_loopback() {
+  local name=$1
+  flutter create --platforms android --org dev.test --project-name $name \
+    "$OUT/$name" >/dev/null
+  # flutter create's sample widget test targets the template app, which is gone.
+  rm -rf "$OUT/$name/test"
+  local main=$OUT/$name/android/app/src/main
+  mkdir -p "$main/java/dev/test/loopback" "$main/res/xml"
+  cp "$HERE/loopback/LoopbackService.java" "$main/java/dev/test/loopback/"
+  cp "$HERE/loopback/loopback_device_info.xml" "$main/res/xml/"
+  python3 - "$main/AndroidManifest.xml" <<'EOF2'
 import sys
 p = sys.argv[1]
 s = open(p).read()
@@ -46,8 +52,11 @@ s = s.replace('    </application>', '''        <service android:name="dev.test.l
         </service>
     </application>''', 1)
 open(p, 'w').write(s)
-EOF
-(cd "$OUT/midi_loopback" && flutter build apk --debug)
+EOF2
+  (cd "$OUT/$name" && flutter build apk --debug)
+}
+make_loopback midi_loopback
+make_loopback midi_loopback2
 
 # --- harness -----------------------------------------------------------------
 flutter create --platforms android --org dev.test --project-name lrm_harness \

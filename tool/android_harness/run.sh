@@ -3,7 +3,7 @@
 #
 #   run.sh <adb-serial> [harness.apk]
 #
-# Installs both apps, starts the harness with the loopback service stopped (so
+# Installs the apps, starts the harness with the loopback services stopped (so
 # the first open has to bind it, as with a Bluetooth device), removes and
 # re-adds the loopback device five times while the harness has an input open,
 # then prints the results. Exits 0 only if every check passed ("VERDICT: PASS").
@@ -13,16 +13,20 @@ set -u
 D=${1:?usage: run.sh <adb-serial> [harness.apk]}
 HERE=${0:A:h}
 LOOP=$HERE/build/midi_loopback/build/app/outputs/flutter-apk/app-debug.apk
+LOOP2=$HERE/build/midi_loopback2/build/app/outputs/flutter-apk/app-debug.apk
 APK=${2:-$HERE/build/lrm_harness/build/app/outputs/flutter-apk/app-release.apk}
 
 adb -s $D install -r $LOOP >/dev/null
+adb -s $D install -r $LOOP2 >/dev/null
 adb -s $D install -r $APK >/dev/null
 adb -s $D shell am force-stop dev.test.lrm_harness
 adb -s $D shell am force-stop dev.test.midi_loopback
+adb -s $D shell am force-stop dev.test.midi_loopback2
 adb -s $D logcat -c
 adb -s $D shell am start -n dev.test.lrm_harness/.MainActivity >/dev/null
 
-# Hotplug: wait for the harness to open its window, then cycle the device.
+# Hotplug: wait for the harness to open its window, then cycle the first of the
+# two identical devices; the second stays.
 for i in $(seq 120); do
   adb -s $D logcat -d | grep -q "HARNESS HOTPLUG-WINDOW\|Fatal signal" && break
   sleep 2
@@ -40,9 +44,10 @@ for i in $(seq 180); do
   sleep 1
 done
 # Read right at DONE: the probe that follows leaves an input open on purpose.
+# Sum over both loopback devices.
 conn_count() {
   adb -s $D shell dumpsys midi | grep -E "Loopback.*DeviceConnection count" \
-    | sed -E 's/.*DeviceConnection count: ([0-9]+).*/\1/' | head -1
+    | sed -E 's/.*DeviceConnection count: ([0-9]+).*/\1/' | awk '{s+=$1} END {print s+0}'
 }
 CONN_DONE=$(conn_count)
 for i in $(seq 60); do

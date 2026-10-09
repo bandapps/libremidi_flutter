@@ -13,6 +13,7 @@
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
 #include <dart_api/dart_native_api.h>
+#include <lrm_transport.hpp>
 
 #include <atomic>
 #include <cstdlib>
@@ -784,8 +785,7 @@ static void fill_port_info(const PortType& port, int32_t index, bool is_input, L
     // Type info
     info->transport_type = static_cast<uint8_t>(port.type);
     info->is_input = is_input;
-    info->is_virtual = (port.type == libremidi::transport_type::software ||
-                        port.type == libremidi::transport_type::loopback);
+    info->is_virtual = lrm_is_virtual_transport(port.type);
 }
 
 extern "C" FFI_PLUGIN_EXPORT int32_t lrm_observer_get_input(LrmObserver* observer, int32_t index, LrmPortInfo* info) {

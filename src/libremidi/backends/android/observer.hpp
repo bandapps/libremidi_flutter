@@ -116,12 +116,14 @@ private:
     }
   }
 
-  // Ports are matched by their identifying strings, not by handle: Android
-  // hands out a new device id when a device reconnects.
+  // Ports are matched by handle (device id + port index). Matching by name
+  // merged identical devices, so removing one of two identical controllers
+  // went unreported. A reconnected device has a new id and is reported as
+  // removed and added, which is what happened.
   template <typename Port>
-  static std::string port_key(const Port& p)
+  static port_handle port_key(const Port& p)
   {
-    return p.port_name + "|" + p.manufacturer + "|" + p.product + "|" + p.serial;
+    return p.port;
   }
 
   template <typename Port, typename Callback>
@@ -129,7 +131,7 @@ private:
       std::vector<Port>& cache, std::vector<Port> current, const Callback& added,
       const Callback& removed)
   {
-    std::set<std::string> before, after;
+    std::set<port_handle> before, after;
     for (const auto& p : cache)
       before.insert(port_key(p));
     for (const auto& p : current)

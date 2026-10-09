@@ -184,6 +184,10 @@ class MidiPort {
   final int stableId;
 
   /// Unique port ID (CoreMIDI: kMIDIPropertyUniqueID).
+  ///
+  /// On Android it is unique only while the device stays connected: Android
+  /// numbers devices per connection, so a reconnected device gets a new id.
+  /// Persist [toMatchJson] and use [MidiObserver.findClosestPort] instead.
   final int portId;
 
   /// API client handle.
@@ -254,12 +258,15 @@ class MidiPort {
   ///
   /// Uses [stableId] (hash-based) when the device provides enough identifying
   /// info (product or serial). Falls back to [portId] (platform-specific unique
-  /// ID) when hash would be unreliable due to missing device info.
+  /// ID) when hash would be unreliable due to missing device info — except on
+  /// Android, where [portId] does not survive a reconnect.
   ///
   /// Use this instead of [stableId] directly when you need to persist port
   /// selections across app restarts or reconnects.
   int get effectiveStableId =>
-      (serial.isEmpty && product.isEmpty) ? portId : stableId;
+      (serial.isEmpty && product.isEmpty && !Platform.isAndroid)
+          ? portId
+          : stableId;
 
   /// Returns all port info as a Map (keys match libremidi naming).
   Map<String, dynamic> toMap() => {
