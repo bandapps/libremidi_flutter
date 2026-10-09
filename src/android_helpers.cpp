@@ -8,10 +8,13 @@
 #include <libremidi/backends/android/midi_in.hpp>
 #include <libremidi/backends/android/midi_out.hpp>
 
+#include <deque>
 #include <iterator>
 #include <condition_variable>
 #include <map>
 #include <mutex>
+
+#include <pthread.h>
 
 // Declaration of our custom FindClass function from jni_shim.cpp
 extern "C" jclass libremidi_find_class(JNIEnv* env, const char* name);
@@ -70,31 +73,89 @@ NAMESPACE_LIBREMIDI::android
 // Main source of knowledge is RtMidi implementation
 // which was done by Yellow Labrador
 
+namespace
+{
+// Threads that get_thread_env() attached to the JVM must be detached again
+// before they exit; ART requires it. These are native threads we do not own
+// (Dart worker threads, which the VM retires when idle), so there is no
+// shutdown hook to call DetachCurrentThread from. A pthread key destructor
+// runs on the exiting thread itself, which is the documented way to do it.
+pthread_key_t& detach_key()
+{
+  static pthread_key_t key;
+  return key;
+}
+
+void detach_on_thread_exit(void* vm)
+{
+  static_cast<JavaVM*>(vm)->DetachCurrentThread();
+}
+
+bool init_detach_key()
+{
+  static const bool ok = pthread_key_create(&detach_key(), detach_on_thread_exit) == 0;
+  return ok;
+}
+}
+
 JNIEnv* context::get_thread_env()
 {
-  JNIEnv* env;
-  JavaVM* jvm;
-  jsize count;
+  JNIEnv* env = nullptr;
+  JavaVM* jvm = nullptr;
+  jsize count = 0;
   if (JNI_GetCreatedJavaVMs(&jvm, 1, &count) != JNI_OK || count < 1)
   {
     LOGE("No JVM found");
     return nullptr;
   }
 
-  if (jvm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED)
+  const jint status = jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+  if (status == JNI_OK)
+    return env;
+
+  if (status != JNI_EDETACHED)
   {
-    if (jvm->AttachCurrentThread(&env, nullptr) != JNI_OK)
-    {
-      LOGE("Failed to attach thread");
-      return nullptr;
-    }
+    LOGE("GetEnv failed (%d)", (int)status);
+    return nullptr;
+  }
+
+  if (!init_detach_key())
+  {
+    // Attaching without a way to detach would abort the process when this
+    // thread exits, so refuse instead.
+    LOGE("Cannot register thread-exit detach");
+    return nullptr;
+  }
+
+  if (jvm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+  {
+    LOGE("Failed to attach thread");
+    return nullptr;
+  }
+
+  if (pthread_setspecific(detach_key(), jvm) != 0)
+  {
+    LOGE("Cannot register thread-exit detach");
+    jvm->DetachCurrentThread();
+    return nullptr;
   }
 
   return env;
 }
 
+// Returns the Application as a global reference that lives for the rest of
+// the process; callers must not delete it. Handing out a fresh local reference
+// per call leaked one reference per enumeration on threads that never return
+// to Java, until ART's local reference table overflowed.
 jobject context::get_context(JNIEnv* env)
 {
+  static std::mutex mutex;
+  static jobject cached = nullptr;
+
+  std::lock_guard<std::mutex> lock(mutex);
+  if (cached)
+    return cached;
+
   local_frame frame{env};
 
   auto activity_thread = env->FindClass("android/app/ActivityThread");
@@ -118,8 +179,8 @@ jobject context::get_context(JNIEnv* env)
     return nullptr;
   }
 
-  // Hand the Application object back out; everything else in the frame goes.
-  return frame.pop_keeping(app);
+  cached = env->NewGlobalRef(app);
+  return cached;
 }
 
 jobject context::get_midi_manager(JNIEnv* env, jobject ctx)
@@ -223,6 +284,14 @@ std::string context::port_name(JNIEnv* env, unsigned int port_number)
       = env->GetMethodID(bundle_class, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
 
   std::string result = get_bundle_string(env, bundle, bundle_class, get_string_method, "name");
+  // MidiDeviceService apps often declare only manufacturer/product (Google's
+  // own sample does), which left the port named just " Port 1".
+  if (result.empty())
+    result = get_bundle_string(env, bundle, bundle_class, get_string_method, "product");
+  if (result.empty())
+    result = get_bundle_string(env, bundle, bundle_class, get_string_method, "manufacturer");
+  if (result.empty())
+    result = "MIDI Device";
   // Append port index to distinguish multiple ports on same device (1-based for display)
   result += " Port " + std::to_string(entry.port_index + 1);
 
@@ -473,39 +542,26 @@ void finish_pending_open(int64_t token)
   pending_opens_cv().notify_all();
 }
 
-bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool is_output)
+// Hands one open request to MidiManager.openDevice(). Returns false when
+// nothing reached Java, i.e. no callback will arrive for this token; the token
+// is left registered so the caller can resolve it.
+static bool issue_open_device(JNIEnv* env, jobject device_info, int64_t token, bool is_output)
 {
-  LOGI("open_device called, is_output=%d, token=%lld, port_index=%d", is_output,
-       (long long)token, port_entry.port_index);
-
-  auto env = get_thread_env();
-  if (!env) {
-    LOGE("open_device: failed to get JNI env");
-    finish_pending_open(token);
-    return false;
-  }
+  LOGI("open_device: issuing, is_output=%d, token=%lld", is_output, (long long)token);
 
   local_frame frame{env};
 
-  // Every failure path from here on must release the token, otherwise the
-  // entry lingers until the object is closed and cancel_pending_open() has to
-  // clean up an open that never reached Java.
-  auto ctx = get_context(env);
+  auto ctx = context::get_context(env);
   if (!ctx)
   {
-    finish_pending_open(token);
     return false;
   }
 
-  auto midi_mgr = get_midi_manager(env, ctx);
+  auto midi_mgr = context::get_midi_manager(env, ctx);
   if (!midi_mgr)
   {
-    finish_pending_open(token);
     return false;
   }
-
-  // Store port index for use in the callback
-  // The port index travels with the token, not in a shared variable.
 
   // Check if we're on the main thread.
   //
@@ -523,7 +579,6 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
   {
     LOGE("open_device: android.os.Looper.myLooper not found");
     env->ExceptionClear();
-    finish_pending_open(token);
     return false;
   }
   auto my_looper = env->CallStaticObjectMethod(looper_class, get_my_looper_method);
@@ -542,8 +597,7 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     {
       LOGE("open_device: could not reach Handler(Looper)");
       env->ExceptionClear();
-      finish_pending_open(token);
-      return false;
+        return false;
     }
 
     auto main_looper = env->CallStaticObjectMethod(looper_class, get_main_looper_method);
@@ -555,8 +609,7 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     {
       LOGE("open_device: could not construct the main-looper Handler");
       env->ExceptionClear();
-      finish_pending_open(token);
-      return false;
+        return false;
     }
   }
 
@@ -568,7 +621,6 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     LOGE("MidiDeviceCallback class not found - ensure the Java class is loaded");
     if (handler)
       env->DeleteLocalRef(handler);
-    finish_pending_open(token);
     return false;
   }
   LOGI("open_device: MidiDeviceCallback class found");
@@ -580,7 +632,6 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     env->ExceptionClear();
     if (handler)
       env->DeleteLocalRef(handler);
-    finish_pending_open(token);
     return false;
   }
 
@@ -592,7 +643,6 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     env->ExceptionClear();
     if (handler)
       env->DeleteLocalRef(handler);
-    finish_pending_open(token);
     return false;
   }
   LOGI("open_device: MidiDeviceCallback object created");
@@ -612,11 +662,10 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
     env->DeleteLocalRef(callback);
     if (handler)
       env->DeleteLocalRef(handler);
-    finish_pending_open(token);
     return false;
   }
 
-  env->CallVoidMethod(midi_mgr, open_device_method, port_entry.device_info, callback, handler);
+  env->CallVoidMethod(midi_mgr, open_device_method, device_info, callback, handler);
 
   // A throwing openDevice() means no callback will ever arrive, so this has to
   // be reported as a failed open rather than left pending.
@@ -634,10 +683,260 @@ bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool
 
   if (threw)
   {
-    finish_pending_open(token);
     return false;
   }
   return true;
+}
+
+// Opens are serialised per device.
+//
+// For a device whose MidiDeviceService is not bound yet — virtual devices and
+// Bluetooth MIDI — MidiService binds the service on the first connection and
+// rejects every further one until the bind completes ("No way to connect to
+// device in addDeviceConnection"), handing back a null device. Opening the
+// input and output of a Bluetooth controller together therefore lost one of
+// them. A request for a device that already has an open in flight now waits
+// until that open has called back; by then the service is bound and the next
+// connection is accepted. USB devices are always bound, so for them this only
+// orders the requests.
+namespace
+{
+struct queued_open
+{
+  int64_t token;
+  jobject device_info;  // own global ref, the port cache may be rebuilt meanwhile
+  bool is_output;
+};
+
+struct device_queue
+{
+  std::deque<queued_open> waiting;
+};
+
+std::mutex& open_queue_mutex()
+{
+  static std::mutex m;
+  return m;
+}
+
+// Keyed by MidiDeviceInfo.getId(). An entry exists while an open for that
+// device is in flight.
+std::map<jint, device_queue>& open_queues()
+{
+  static std::map<jint, device_queue> m;
+  return m;
+}
+
+// The device each in-flight token belongs to.
+std::map<int64_t, jint>& in_flight_device()
+{
+  static std::map<int64_t, jint> m;
+  return m;
+}
+
+jint device_id(JNIEnv* env, jobject device_info)
+{
+  local_frame frame{env};
+  auto cls = env->FindClass("android/media/midi/MidiDeviceInfo");
+  auto get_id = cls ? env->GetMethodID(cls, "getId", "()I") : nullptr;
+  if (!get_id)
+  {
+    env->ExceptionClear();
+    return -1;
+  }
+  return env->CallIntMethod(device_info, get_id);
+}
+
+bool is_pending(int64_t token)
+{
+  std::lock_guard<std::mutex> lock(pending_opens_mutex());
+  return pending_opens().count(token) != 0;
+}
+
+void close_java_device(JNIEnv* env, jobject java_device)
+{
+  if (!java_device)
+    return;
+  local_frame frame{env};
+  auto cls = env->GetObjectClass(java_device);
+  auto close = cls ? env->GetMethodID(cls, "close", "()V") : nullptr;
+  if (close)
+    env->CallVoidMethod(java_device, close);
+  // close() declares IOException; nothing useful to do with it here.
+  if (env->ExceptionCheck())
+  {
+    LOGW("MidiDevice.close() threw");
+    env->ExceptionClear();
+  }
+}
+
+// Resolves a token with the result of its open: hands the device to the
+// requester, or tells it the open failed, or — if the requester is gone —
+// closes the device again. `midi_device` may be null for a failed open.
+void deliver_open_result(JNIEnv* env, int64_t token, jobject midi_device)
+{
+  pending_open pending{};
+  if (!take_pending_open(token, pending))
+  {
+    // The midi_in/midi_out that asked for this device has been closed in the
+    // meantime, so there is nothing to call back into. Close the connection,
+    // otherwise MidiService keeps it until the process dies.
+    LOGI("onDeviceOpened: request was cancelled, closing the device");
+    close_java_device(env, midi_device);
+    return;
+  }
+
+  auto fail = [&] {
+    if (pending.is_output)
+      midi_out::open_failed(reinterpret_cast<midi_out*>(pending.target));
+    else
+      midi_in::open_failed(reinterpret_cast<midi_in*>(pending.target));
+    finish_pending_open(token);
+  };
+
+  // MidiManager reports a failed open by passing null. The requester is pinned
+  // for the duration of this call, so clearing its state here is safe.
+  if (!midi_device)
+  {
+    LOGE("onDeviceOpened: MidiManager returned no device");
+    fail();
+    return;
+  }
+
+  AMidiDevice* amidi_device = nullptr;
+  AMidiDevice_fromJava(env, midi_device, &amidi_device);
+  jobject java_device = amidi_device ? env->NewGlobalRef(midi_device) : nullptr;
+  if (!amidi_device || !java_device)
+  {
+    LOGE("Failed to convert Java MIDI device to AMidiDevice");
+    if (amidi_device)
+      AMidiDevice_release(amidi_device);
+    close_java_device(env, midi_device);
+    fail();
+    return;
+  }
+
+  // The port index comes from the token, so overlapping opens cannot steal each
+  // other's target port.
+  if (pending.is_output)
+    midi_out::open_callback(
+        reinterpret_cast<midi_out*>(pending.target), amidi_device, java_device,
+        pending.port_index);
+  else
+    midi_in::open_callback(
+        reinterpret_cast<midi_in*>(pending.target), amidi_device, java_device,
+        pending.port_index);
+
+  // Unpin: from here on close_port() may destroy the object.
+  finish_pending_open(token);
+}
+
+// Called once the open for `token` has concluded, however it ended. Issues the
+// next waiting request for the same device, if any.
+void advance_open_queue(JNIEnv* env, int64_t token)
+{
+  for (;;)
+  {
+    queued_open next{};
+    {
+      std::lock_guard<std::mutex> lock(open_queue_mutex());
+      auto dev = in_flight_device().find(token);
+      if (dev == in_flight_device().end())
+        return;
+      const jint id = dev->second;
+      in_flight_device().erase(dev);
+
+      auto q = open_queues().find(id);
+      if (q == open_queues().end())
+        return;
+      if (q->second.waiting.empty())
+      {
+        open_queues().erase(q);
+        return;
+      }
+      next = q->second.waiting.front();
+      q->second.waiting.pop_front();
+      in_flight_device()[next.token] = id;
+    }
+
+    bool issued = false;
+    if (is_pending(next.token))
+      issued = issue_open_device(env, next.device_info, next.token, next.is_output);
+    else
+      LOGI("open_device: queued request %lld was cancelled", (long long)next.token);
+    env->DeleteGlobalRef(next.device_info);
+
+    if (issued)
+      return;
+
+    // Nothing reached Java for this one, so no callback will advance the
+    // queue: resolve it as failed here and move on to the next request.
+    deliver_open_result(env, next.token, nullptr);
+    token = next.token;
+  }
+}
+}
+
+bool context::open_device(const midi_port_entry& port_entry, int64_t token, bool is_output)
+{
+  LOGI("open_device called, is_output=%d, token=%lld, port_index=%d", is_output,
+       (long long)token, port_entry.port_index);
+
+  auto env = get_thread_env();
+  if (!env)
+  {
+    LOGE("open_device: failed to get JNI env");
+    finish_pending_open(token);
+    return false;
+  }
+
+  const jint id = device_id(env, port_entry.device_info);
+  {
+    std::lock_guard<std::mutex> lock(open_queue_mutex());
+    auto q = open_queues().find(id);
+    if (q != open_queues().end())
+    {
+      jobject info = env->NewGlobalRef(port_entry.device_info);
+      if (!info)
+      {
+        env->ExceptionClear();
+        finish_pending_open(token);
+        return false;
+      }
+      LOGI("open_device: device %d busy, queueing token %lld", (int)id, (long long)token);
+      q->second.waiting.push_back({token, info, is_output});
+      return true;
+    }
+    open_queues()[id];
+    in_flight_device()[token] = id;
+  }
+
+  if (issue_open_device(env, port_entry.device_info, token, is_output))
+    return true;
+
+  // Nothing was handed to Java. The caller resets its own state when this
+  // returns false; release the token and let anything queued meanwhile go.
+  finish_pending_open(token);
+  advance_open_queue(env, token);
+  return false;
+}
+
+void context::close_device(AMidiDevice* device, jobject java_device)
+{
+  if (device)
+    AMidiDevice_release(device);
+  if (!java_device)
+    return;
+
+  if (auto env = get_thread_env())
+  {
+    close_java_device(env, java_device);
+    env->DeleteGlobalRef(java_device);
+  }
+  else
+  {
+    LOGE("close_device: no JNI env, MidiDevice left open");
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_dev_celtera_libremidi_MidiDeviceCallback_onDeviceOpened(
@@ -651,67 +950,8 @@ extern "C" JNIEXPORT void JNICALL Java_dev_celtera_libremidi_MidiDeviceCallback_
     return;
   }
 
-  // Resolve the token before touching anything. If the midi_in/midi_out that
-  // asked for this device has been closed in the meantime, the token is gone
-  // and there is nothing to call back into — the previous code dereferenced a
-  // destroyed object here.
-  pending_open pending{};
-  if (!take_pending_open(token, pending))
-  {
-    LOGI("onDeviceOpened: request was cancelled, releasing the device");
-    if (midi_device)
-    {
-      AMidiDevice* orphan = nullptr;
-      AMidiDevice_fromJava(env, midi_device, &orphan);
-      if (orphan)
-        AMidiDevice_release(orphan);
-    }
-    return;
-  }
-
-  // MidiManager reports a failed open by passing null. Clear the requester's
-  // state here: it is pinned for the duration of this call, so touching it is
-  // safe, and nothing else will ever come back for this token.
-  if (!midi_device)
-  {
-    LOGE("onDeviceOpened: MidiManager returned no device");
-    if (pending.is_output)
-      midi_out::open_failed(reinterpret_cast<midi_out*>(pending.target));
-    else
-      midi_in::open_failed(reinterpret_cast<midi_in*>(pending.target));
-    finish_pending_open(token);
-    return;
-  }
-
-  AMidiDevice* amidi_device = nullptr;
-  AMidiDevice_fromJava(env, midi_device, &amidi_device);
-
-  if (!amidi_device)
-  {
-    LOGE("Failed to convert Java MIDI device to AMidiDevice");
-    if (pending.is_output)
-      midi_out::open_failed(reinterpret_cast<midi_out*>(pending.target));
-    else
-      midi_in::open_failed(reinterpret_cast<midi_in*>(pending.target));
-    finish_pending_open(token);
-    return;
-  }
-
-  // The port index comes from the token, so overlapping opens cannot steal each
-  // other's target port any more.
-  if (pending.is_output)
-  {
-    midi_out::open_callback(
-        reinterpret_cast<midi_out*>(pending.target), amidi_device, pending.port_index);
-  }
-  else
-  {
-    midi_in::open_callback(
-        reinterpret_cast<midi_in*>(pending.target), amidi_device, pending.port_index);
-  }
-
-  // Unpin: from here on close_port() may destroy the object.
-  finish_pending_open(token);
+  deliver_open_result(env, token, midi_device);
+  advance_open_queue(env, token);
 }
 
 // =============================================================================

@@ -62,6 +62,12 @@ struct context
   // Returns false when nothing was handed to Java, i.e. no callback will ever
   // arrive for this token. The token is released on those paths.
   static bool open_device(const midi_port_entry& port_entry, int64_t token, bool is_output);
+  // Ends a device connection opened through open_device(): releases the native
+  // handle and closes the Java MidiDevice, then drops the global reference.
+  // AMidiDevice_release() alone only detaches the native object; the
+  // connection in MidiService (and for Bluetooth the radio link) stays up
+  // until the Java side is closed. Either argument may be null.
+  static void close_device(AMidiDevice* device, jobject java_device);
   static std::string port_name(JNIEnv* env, unsigned int port_number);
   static void cleanup_devices(JNIEnv* env);
 

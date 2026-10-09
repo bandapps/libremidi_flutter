@@ -42,11 +42,13 @@ public:
         auto ctx = context::get_context(env);
         if (ctx)
         {
-          midi_manager = context::get_midi_manager(env, ctx);
-          if (midi_manager)
+          auto local_manager = context::get_midi_manager(env, ctx);
+          if (local_manager)
           {
-            // Keep a global ref to the midi manager
-            midi_manager = env->NewGlobalRef(midi_manager);
+            // Keep a global ref to the midi manager; drop the local one, which
+            // this thread would otherwise hold until it returns to Java.
+            midi_manager = env->NewGlobalRef(local_manager);
+            env->DeleteLocalRef(local_manager);
 
             // Register for device callbacks
             device_callback = context::register_device_callback(env, midi_manager, this);

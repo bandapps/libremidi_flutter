@@ -100,16 +100,17 @@ public:
     // between that load and AMidiInputPort_send().
     AMidiInputPort* port = nullptr;
     AMidiDevice* device = nullptr;
+    jobject jdevice = nullptr;
     {
       std::lock_guard<std::mutex> lock(port_mutex);
       port = midi_input_port.exchange(nullptr, std::memory_order_acq_rel);
       device = send_device.exchange(nullptr, std::memory_order_acq_rel);
+      jdevice = java_device.exchange(nullptr, std::memory_order_acq_rel);
     }
 
     if (port)
       AMidiInputPort_close(port);
-    if (device)
-      AMidiDevice_release(device);
+    context::close_device(device, jdevice);
 
     return stdx::error{};
   }
@@ -149,7 +150,8 @@ public:
     return stdx::error{};
   }
 
-  static void open_callback(midi_out* self, AMidiDevice* device, int port_index)
+  // Takes ownership of `device` and of the global reference `jdevice`.
+  static void open_callback(midi_out* self, AMidiDevice* device, jobject jdevice, int port_index)
   {
     AMidiInputPort* port = nullptr;
     if (AMidiInputPort_open(device, port_index, &port) != AMEDIA_OK)
@@ -157,10 +159,11 @@ public:
       LOGE("AMidiInputPort_open failed for port %d", port_index);
       // See midi_in: close_port() bails out early, so release the device here
       // rather than leaking it.
-      AMidiDevice_release(device);
+      context::close_device(device, jdevice);
       open_failed(self);
       return;
     }
+    self->java_device.store(jdevice, std::memory_order_release);
     self->send_device.store(device, std::memory_order_release);
     self->midi_input_port.store(port, std::memory_order_release);
   }
@@ -173,6 +176,7 @@ private:
   // Serialises sending against closing; see send_message() and close_port().
   mutable std::mutex port_mutex;
   std::atomic<AMidiDevice*> send_device{nullptr};
+  std::atomic<jobject> java_device{nullptr};  // global ref to the MidiDevice
   std::atomic<AMidiInputPort*> midi_input_port{nullptr};
   std::atomic<bool> port_requested{false};
 };

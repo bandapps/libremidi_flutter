@@ -112,10 +112,9 @@ public:
       AMidiOutputPort_close(port);
     }
 
-    if (auto* device = receive_device.exchange(nullptr, std::memory_order_acq_rel))
-    {
-      AMidiDevice_release(device);
-    }
+    context::close_device(
+        receive_device.exchange(nullptr, std::memory_order_acq_rel),
+        java_device.exchange(nullptr, std::memory_order_acq_rel));
 
     return stdx::error{};
   }
@@ -160,14 +159,18 @@ public:
 
     while (running)
     {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
+      // AMidiOutputPort_receive() hands out one message per call and does not
+      // block. Sleep only when the queue is empty: sleeping before every call
+      // capped delivery at about one message per millisecond, so dense input
+      // (SysEx dumps, controller sweeps) piled up and arrived late.
       ssize_t num_messages = AMidiOutputPort_receive(
           port, &op_code, buffer, sizeof(buffer), &num_bytes, &timestamp);
 
-      if (num_messages < 0)
+      if (num_messages <= 0)
       {
-        LOGE("Error receiving MIDI data: %d", (int)num_messages);
+        if (num_messages < 0)
+          LOGE("Error receiving MIDI data: %d", (int)num_messages);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
 
@@ -182,7 +185,8 @@ public:
     }
   }
 
-  static void open_callback(midi_in* self, AMidiDevice* device, int port_index)
+  // Takes ownership of `device` and of the global reference `jdevice`.
+  static void open_callback(midi_in* self, AMidiDevice* device, jobject jdevice, int port_index)
   {
     // Check the result: on failure starting the poll thread would spin
     // AMidiOutputPort_receive() on a null port forever, while the API reported
@@ -192,12 +196,13 @@ public:
     {
       LOGE("AMidiOutputPort_open failed for port %d", port_index);
       // Release the device here: close_port() bails out early once the request
-      // is cleared, so it would never get to AMidiDevice_release().
-      AMidiDevice_release(device);
+      // is cleared, so it would never get to close_device().
+      context::close_device(device, jdevice);
       open_failed(self);
       return;
     }
     // Publish both before the poll thread can observe them.
+    self->java_device.store(jdevice, std::memory_order_release);
     self->receive_device.store(device, std::memory_order_release);
     self->midi_output_port.store(port, std::memory_order_release);
     self->start_midi_thread();
@@ -210,6 +215,7 @@ private:
   // pointers here were a data race, and is_port_open()/send paths made it a
   // read from yet another thread.
   std::atomic<AMidiDevice*> receive_device{nullptr};
+  std::atomic<jobject> java_device{nullptr};  // global ref to the MidiDevice
   std::atomic<AMidiOutputPort*> midi_output_port{nullptr};
   std::thread poll_thread;
   std::atomic<bool> port_requested{false};
