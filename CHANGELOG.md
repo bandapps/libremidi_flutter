@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.7
+
+### Fixed
+
+- **Android release builds crashed on startup.** R8 stripped the Java callback classes that the native layer only reaches through JNI, so any app with minification enabled (the Flutter default for release builds) aborted with `NoSuchMethodError` when the plugin initialized. Debug builds were unaffected. The plugin now ships consumer ProGuard rules that keep these classes; apps need no keep rules of their own.
+- A missing Android callback class no longer aborts the process. Hotplug registration now fails cleanly instead of leaving a Java exception pending.
+
 ## 0.8.6
 
 ### Fixed

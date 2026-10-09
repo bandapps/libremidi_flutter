@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'libremidi_flutter'
-  s.version          = '0.8.6'
+  s.version          = '0.8.7'
   s.summary          = 'Cross-platform MIDI device access for Flutter using libremidi.'
   s.description      = <<-DESC
 A Flutter plugin providing MIDI device listing, connection, and communication
