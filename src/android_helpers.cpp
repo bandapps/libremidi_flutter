@@ -737,6 +737,9 @@ jobject context::register_device_callback(JNIEnv* env, jobject midi_manager, voi
   if (!callback_ctor)
   {
     LOGE("MidiDeviceStatusCallback constructor not found");
+    // GetMethodID leaves a NoSuchMethodError pending on failure; returning
+    // with it pending aborts the process on the next JNI call.
+    env->ExceptionClear();
     return nullptr;
   }
 
@@ -744,6 +747,7 @@ jobject context::register_device_callback(JNIEnv* env, jobject midi_manager, voi
   if (!callback)
   {
     LOGE("Failed to create MidiDeviceStatusCallback");
+    env->ExceptionClear();
     return nullptr;
   }
 
@@ -756,6 +760,7 @@ jobject context::register_device_callback(JNIEnv* env, jobject midi_manager, voi
   if (!register_method)
   {
     LOGE("registerDeviceCallback method not found");
+    env->ExceptionClear();
     env->DeleteLocalRef(callback);
     return nullptr;
   }
@@ -773,6 +778,14 @@ jobject context::register_device_callback(JNIEnv* env, jobject midi_manager, voi
 
   env->DeleteLocalRef(handler);
   env->DeleteLocalRef(main_looper);
+
+  if (env->ExceptionCheck())
+  {
+    LOGE("registerDeviceCallback threw");
+    env->ExceptionClear();
+    env->DeleteLocalRef(callback);
+    return nullptr;
+  }
 
   // Return a global ref to keep the callback alive
   jobject global_callback = env->NewGlobalRef(callback);
@@ -797,6 +810,11 @@ void context::unregister_device_callback(JNIEnv* env, jobject midi_manager, jobj
   if (invalidate_method)
   {
     env->CallVoidMethod(callback, invalidate_method);
+  }
+  else
+  {
+    LOGE("MidiDeviceStatusCallback.invalidate not found");
+    env->ExceptionClear();
   }
 
   // Unregister from MidiManager
