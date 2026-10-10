@@ -64,12 +64,54 @@
 // destination cannot hold the message, it is dropped rather than emitted
 // short, since a truncated SysEx is indistinguishable from a complete one.
 //
-// Keep `src` ahead of `third_party` in the header search order or this copy is
-// silently bypassed and both defects return.
+// ---------------------------------------------------------------------------
+// 5. A SysEx7 packet trusted to declare an impossible size (receive direction)
+// ---------------------------------------------------------------------------
+//
+// cmidi2_ump_get_sysex7_num_bytes() is the low nibble of byte 1, straight off
+// the wire, so it can say up to 15 while a SysEx7 packet carries at most 6.
+// Upstream copies that many bytes out of the 64-bit packet, and from index 9
+// on (7 - index) * 8 goes negative — a shift by a negative count is undefined
+// behaviour, and the bytes are meaningless regardless. Now treated as the
+// malformed packet it is.
 //
 // ---------------------------------------------------------------------------
-// 3. Word index seeded from a byte counter, and a bounds check in the wrong
-//    unit (send direction)
+// Found during the same audit, left alone — not reachable from this plugin
+// ---------------------------------------------------------------------------
+//
+//  * cmidi2_ump_get_byte_from_uint32() uses the 64-bit shift formula on a
+//    32-bit value, so every index is an out-of-range shift. Nothing calls it.
+//  * In the CMIDI2_PROTOCOL_TYPE_MIDI1 output branch, a 32-bit UMP is assigned
+//    to dst[*dIdx] where dst is uint8_t* — it keeps the low byte and skips four.
+//    That whole branch produces garbage. The context defaults to the MIDI 2
+//    protocol and libremidi never changes it.
+//  * cmidi2_midi1_get_message_size() treats any byte below 0x80 as a 3-byte
+//    channel message, so a stream using running status converts to nonsense
+//    rather than being rejected.
+//  * cmidi2_ump_sysex7_get_sysex_length() scans for 0xF7 with no length limit.
+//    Safe only because its one caller checks with memchr first.
+//  * The delta-time path advances dst without reducing maxBytes, so every
+//    bounds check below it is short by that much. Unreachable here:
+//    conversion.hpp sets skip_delta_time.
+//
+// Keep `src` ahead of `third_party` in the header search order or this copy is
+// silently bypassed and all of the above return.
+//
+// ---------------------------------------------------------------------------
+// 3. No bounds check at all on the UMP output buffer (send direction)
+// ---------------------------------------------------------------------------
+//
+// cmidi2_convert_midi1_to_ump() consults dLen in the SysEx branch and nowhere
+// else. Channel voice messages were emitted unchecked, and each three-byte
+// MIDI 1 message becomes an eight-byte UMP, so roughly 24 KB handed to
+// send() in one call wrote past the end of context->ump. lrm_midi_out_send()
+// takes an arbitrary byte range, so that length is the caller's to choose.
+// Covered by an integration test, confirmed to corrupt the process without the
+// check.
+//
+// ---------------------------------------------------------------------------
+// 4. Word index seeded from a byte counter, and the SysEx bounds check in the
+//    wrong unit (send direction)
 // ---------------------------------------------------------------------------
 //
 // In the same SysEx branch, `sysExCtx.dst_offset = *dIdx` seeds an index into
@@ -3019,6 +3061,15 @@ cmidi2_convert_midi1_to_ump(cmidi2_midi_conversion_context* context)
         }
         if (!skipEmitUmp)
         {
+          // PATCHED: nothing checked the output buffer here. dLen is consulted
+          // in the SysEx branch and nowhere else, so a long run of channel
+          // voice messages simply kept writing: each 3-byte MIDI 1 message
+          // becomes an 8-byte UMP, so roughly 24 KB passed to send() in one
+          // call ran past the end of context->ump. lrm_midi_out_send() takes an
+          // arbitrary byte range, so the length is the caller's to choose.
+          if (*dIdx + (size_t)outputUmpLen * sizeof(cmidi2_ump) > dLen)
+            return CMIDI2_CONVERSION_RESULT_OUT_OF_SPACE;
+
           switch (outputUmpLen)
           {
             case 1:
@@ -3275,9 +3326,20 @@ LIBREMIDI_STATIC size_t cmidi2_convert_single_ump_to_timed_midi1(
             context->sysex7_overflow = false;
           }
         }
+        // PATCHED: the byte count comes straight off the wire —
+        // cmidi2_ump_get_sysex7_num_bytes() is the low nibble of byte 1, so it
+        // can say up to 15 while a SysEx7 packet carries at most 6. Upstream
+        // trusts it, and the read below then asks for byte index 9 and up of a
+        // 64-bit value, where (7 - index) * 8 goes negative: a shift by a
+        // negative count is undefined behaviour, and the bytes are garbage
+        // either way. Treat an impossible count as the malformed packet it is.
+        if (sysex7NumBytesInUmp > 6)
+        {
+          context->sysex7_overflow = true;
+        }
         // PATCHED: bounds check. Upstream has none — safe only while the buffer
         // was reset on every call, an overflow once it persists.
-        if (*sysex7BufferIndex + sysex7NumBytesInUmp > CMIDI2_SYSEX7_BUFFER_SIZE)
+        else if (*sysex7BufferIndex + sysex7NumBytesInUmp > CMIDI2_SYSEX7_BUFFER_SIZE)
         {
           context->sysex7_overflow = true;
         }

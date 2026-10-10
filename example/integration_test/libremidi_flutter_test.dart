@@ -677,6 +677,51 @@ void main() {
       }
     });
 
+    // The MIDI 1 to UMP converter writes into a fixed buffer and checked the
+    // room for SysEx only. Channel voice messages went in unchecked, and each
+    // three-byte message becomes an eight-byte UMP, so a run of them past
+    // roughly 24 KB in a single send() wrote beyond the end of it. send() takes
+    // a byte range, so the length is the caller's to choose.
+    testWidgets('a long run of messages in one send is refused, not written '
+        'past the buffer', (tester) async {
+      final observer = MidiObserver();
+      try {
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final outPort = pair?.$2;
+        if (outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        final output = observer.openOutput(outPort);
+        try {
+          // 12000 note-ons: 36000 bytes in, 96000 bytes of UMP out, well past
+          // the 64 KiB conversion buffer.
+          final many = <int>[];
+          for (var i = 0; i < 12000; i++) {
+            many.addAll(
+                MidiMessageBuilder.noteOn(channel: 0, note: 60, velocity: 64));
+          }
+          expect(
+            () => output.send(Uint8List.fromList(many)),
+            throwsA(isA<MidiException>()),
+            reason: 'more UMP than the conversion buffer holds must be refused',
+          );
+          // A refusal must leave the port usable.
+          expect(
+            () => output.send(
+                MidiMessageBuilder.noteOn(channel: 0, note: 60, velocity: 1)),
+            returnsNormally,
+          );
+        } finally {
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
     // openInputAsync/openOutputAsync open on a native thread and hand the
     // ports back to this isolate; without this test a break in that hand-over
     // (ticket not taken, handle not adopted, messages posted to the wrong
