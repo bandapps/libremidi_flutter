@@ -13,7 +13,7 @@ environment:
   # ffi ^2.2.0 declares sdk '>=3.7.0 <4.0.0', so ^3.1.0 was never actually
   # resolvable — a consumer on Dart 3.1 could not get a matching ffi.
   sdk: ^3.7.0
-  flutter: '>=3.10.0'
+  flutter: '>=3.29.0'
 
 dependencies:
   flutter:
