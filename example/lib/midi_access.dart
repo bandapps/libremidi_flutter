@@ -35,6 +35,21 @@ class MidiDevice {
   String get _identityKey => '$name|${manufacturer ?? ''}|${serial ?? ''}';
 
   String get transportName => transportType?.name ?? '';
+
+  /// Two instances describing the same device are equal.
+  ///
+  /// Every device-list rebuild — and hotplug triggers one — creates fresh
+  /// [MidiDevice] objects. Without this, a dropdown holding the previously
+  /// selected instance finds no match among the new items and falls back to
+  /// showing the first entry, so after re-plugging a device the UI names a
+  /// different one while the ports stay correctly connected. The rest of this
+  /// example already compares devices by [stableId]; this makes `==` agree.
+  @override
+  bool operator ==(Object other) =>
+      other is MidiDevice && other.stableId == stableId;
+
+  @override
+  int get hashCode => stableId.hashCode;
 }
 
 class MidiPortRef {
