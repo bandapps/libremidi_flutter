@@ -15,7 +15,7 @@ MIDI input and output for Flutter apps — device discovery and hotplug detectio
 
 ```yaml
 dependencies:
-  libremidi_flutter: ^0.8.7
+  libremidi_flutter: ^0.9.0
 ```
 
 ## Usage

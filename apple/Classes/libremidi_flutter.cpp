@@ -622,7 +622,7 @@ struct LrmMidiOut {
 // =============================================================================
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
-    return "0.8.7";
+    return "0.9.0";
 }
 
 // Open failures carry no reason on Apple platforms (see the header).

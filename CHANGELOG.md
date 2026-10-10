@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.0
+
+### Fixed
+
+- Android 10 and 11 could not use MIDI.
+- SysEx on Windows MIDI Services hung at 256 bytes and arrived truncated.
+- Hot restart and ending isolates no longer crash the app.
+
+### Added
+
+- `openInputAsync` / `openOutputAsync`.
+- `MidiPort.isHardware`.
+
+### Changed
+
+- `MidiPort ==` compares the connection (`portId`), not the name; use `findClosestPort` to find a device again.
+- Android port ids changed; stored ids do not carry over.
+- Requires Flutter 3.29 or later.
+
 ## 0.8.7
 
 ### Fixed

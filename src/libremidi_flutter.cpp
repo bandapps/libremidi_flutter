@@ -1,7 +1,7 @@
 #include "libremidi_flutter.h"
 
 // Library version
-#define LRM_VERSION "0.8.7"
+#define LRM_VERSION "0.9.0"
 
 // Enable header-only mode
 #define LIBREMIDI_HEADER_ONLY 1
