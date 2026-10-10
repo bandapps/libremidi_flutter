@@ -39,13 +39,34 @@ class FakeMidiAccess extends MidiAccess {
     return input;
   }
 
+  /// Output ports opening or open, by display name. Like the plugin, a port
+  /// counts as open from the start of its open until it is disconnected, and
+  /// a second open meanwhile throws.
+  final _heldOutputs = <String>{};
+  final _outputPorts = <MidiOutputConnection, String>{};
+
   @override
   Future<MidiOutputConnection> openOutput(MidiPortRef port) {
     openOutputCount++;
-    if (!holdOutputOpens) return Future.value(output);
-    final pending = Completer<MidiOutputConnection>();
-    pendingOutputOpens.add(pending);
-    return pending.future;
+    final name = port.displayName;
+    if (!_heldOutputs.add(name)) {
+      return Future.error(StateError('Output port $name is already open'));
+    }
+    final Future<MidiOutputConnection> opened;
+    if (holdOutputOpens) {
+      final pending = Completer<MidiOutputConnection>();
+      pendingOutputOpens.add(pending);
+      opened = pending.future;
+    } else {
+      opened = Future.value(output);
+    }
+    return opened.then((connection) {
+      _outputPorts[connection] = name;
+      return connection;
+    }, onError: (Object e) {
+      _heldOutputs.remove(name);
+      throw e;
+    });
   }
 
   @override
@@ -57,6 +78,8 @@ class FakeMidiAccess extends MidiAccess {
   void disconnectOutput(MidiOutputConnection output) {
     disconnectOutputCount++;
     disconnectedOutputs.add(output);
+    final name = _outputPorts.remove(output);
+    if (name != null) _heldOutputs.remove(name);
   }
 }
 
@@ -298,12 +321,15 @@ void main() {
     await openDeviceDropdown(tester);
     await tester.tap(find.text('Beta').last);
     await tester.pumpAndSettle();
-    expect(midiAccess.pendingOutputOpens, hasLength(2));
+    // Beta's attempt waits for Alpha's to return before opening anything.
+    expect(midiAccess.pendingOutputOpens, hasLength(1));
 
-    // Beta opens first, Alpha's open only completes afterwards.
-    midiAccess.pendingOutputOpens[1].complete(betaOut);
-    await tester.pumpAndSettle();
+    // Alpha's open completes after the switch to Beta.
     midiAccess.pendingOutputOpens[0].complete(alphaOut);
+    await tester.pumpAndSettle();
+    expect(midiAccess.disconnectedOutputs, [alphaOut]);
+    expect(midiAccess.pendingOutputOpens, hasLength(2));
+    midiAccess.pendingOutputOpens[1].complete(betaOut);
     await tester.pumpAndSettle();
 
     expect(midiAccess.disconnectedOutputs, [alphaOut]);
@@ -311,5 +337,49 @@ void main() {
     await tester.pump();
     expect(betaOut.controlChanges, hasLength(1));
     expect(alphaOut.controlChanges, isEmpty);
+  });
+
+  // Without waiting for the superseded attempt, the reconnect opened the port
+  // while the old open still held it, got "already open", and the device
+  // stayed without an output until the next hotplug.
+  testWidgets('a reconnect while the old open is running still connects', (
+    tester,
+  ) async {
+    final midiAccess = FakeMidiAccess(devices: [
+      fakeDevice(name: 'Alpha', output: true),
+    ])
+      ..holdOutputOpens = true;
+    final firstOut = FakeMidiOutputConnection();
+    final secondOut = FakeMidiOutputConnection();
+
+    await tester.pumpWidget(
+      MaterialApp(home: MidiDemoPage(midiAccess: midiAccess)),
+    );
+    await tester.pump();
+
+    await openDeviceDropdown(tester);
+    await tester.tap(find.text('Alpha').last);
+    await tester.pumpAndSettle();
+    expect(midiAccess.pendingOutputOpens, hasLength(1));
+
+    // The device goes away and comes back while its first open is running.
+    midiAccess.devices = [];
+    midiAccess.hotplugController.add(HotplugEventType.outputRemoved);
+    await tester.pumpAndSettle();
+    midiAccess.devices = [fakeDevice(name: 'Alpha', output: true)];
+    midiAccess.hotplugController.add(HotplugEventType.outputAdded);
+    await tester.pumpAndSettle();
+
+    midiAccess.pendingOutputOpens[0].complete(firstOut);
+    await tester.pumpAndSettle();
+    expect(midiAccess.disconnectedOutputs, [firstOut]);
+    expect(midiAccess.pendingOutputOpens, hasLength(2),
+        reason: 'the reconnect must open the port once it is free');
+    midiAccess.pendingOutputOpens[1].complete(secondOut);
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Send'));
+    await tester.pump();
+    expect(secondOut.controlChanges, hasLength(1));
   });
 }

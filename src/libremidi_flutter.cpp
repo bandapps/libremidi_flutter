@@ -393,14 +393,17 @@ struct LrmObserver {
 // outstanding when it closes, and lrm_free ignores a pointer that has already
 // been reclaimed, so a late Dart call cannot double free.
 namespace {
+// Both intentionally never freed, like the deferred releaser: its thread may
+// still release a port while the process exits, after function-local statics
+// have been destroyed.
 std::mutex& message_buffers_mutex() {
-    static std::mutex m;
-    return m;
+    static auto* m = new std::mutex();
+    return *m;
 }
 
 std::unordered_map<void*, const void*>& message_buffers() {
-    static std::unordered_map<void*, const void*> m;
-    return m;
+    static auto* m = new std::unordered_map<void*, const void*>();
+    return *m;
 }
 }
 
@@ -1115,14 +1118,18 @@ extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket)
 namespace {
 class DeferredReleaser {
 public:
+    // Throws if the thread cannot be started or the queue cannot grow; nothing
+    // is queued then, so the caller releases inline. started_ is set only once
+    // the thread runs: setting it first left a failed start permanent, with
+    // every later release queued for a thread that never existed.
     void post(std::function<void()> release) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push_back(std::move(release));
             if (!started_) {
-                started_ = true;
                 std::thread([this] { run(); }).detach();
+                started_ = true;
             }
+            queue_.push_back(std::move(release));
         }
         cv_.notify_one();
     }

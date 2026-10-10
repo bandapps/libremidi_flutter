@@ -39,6 +39,11 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   // opening, and closes them again instead of installing them.
   int _connectGeneration = 0;
   bool _connecting = false;
+  // The latest connect attempt, until it has returned. A superseded attempt
+  // still holds its port while its open is running and closes it only once
+  // the open returns; opening the same port before that fails with "already
+  // open", so the next attempt waits for it.
+  Future<void>? _connectInFlight;
   MidiInputConnection? _midiInput;
   MidiOutputConnection? _midiOutput;
   StreamSubscription<HotplugEventType>? _hotplugSubscription;
@@ -163,7 +168,12 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     final generation = ++_connectGeneration;
     bool superseded() => !mounted || generation != _connectGeneration;
     _connecting = true;
+    final previous = _connectInFlight;
+    final done = Completer<void>();
+    _connectInFlight = done.future;
     try {
+      if (previous != null) await previous;
+      if (superseded()) return null;
       // Open MIDI input and listen for incoming messages
       if (device.inputPorts.isNotEmpty) {
         final idx = _selectedInputIndex.clamp(0, device.inputPorts.length - 1);
@@ -209,6 +219,8 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
       }
       return _midiInput != null || _midiOutput != null;
     } finally {
+      done.complete();
+      if (identical(_connectInFlight, done.future)) _connectInFlight = null;
       if (generation == _connectGeneration) _connecting = false;
     }
   }
