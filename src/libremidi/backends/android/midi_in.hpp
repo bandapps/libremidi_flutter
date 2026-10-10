@@ -4,6 +4,7 @@
 #pragma once
 #include <libremidi/backends/android/config.hpp>
 #include <libremidi/backends/android/helpers.hpp>
+#include <libremidi/backends/android/stream_parser.hpp>
 #include <libremidi/detail/midi_in.hpp>
 #include <libremidi/detail/midi_stream_decoder.hpp>
 
@@ -81,11 +82,17 @@ private:
 
   void read_loop(AMidiOutputPort* port)
   {
+    // AMidi passes on the sender's timestamp in System.nanoTime(), i.e.
+    // CLOCK_MONOTONIC — the same clock as system_ns() here. Declaring that
+    // keeps it; without it libremidi replaced it with the time this thread
+    // happened to fetch the packet. A sender that gives no timestamp (e.g.
+    // AMidiInputPort_send) yields 0; then the time of receipt is used.
     static constexpr timestamp_backend_info timestamp_info{
-        .has_absolute_timestamps = false,
-        .absolute_is_monotonic = false,
+        .has_absolute_timestamps = true,
+        .absolute_is_monotonic = true,
         .has_samples = false,
     };
+    lrm::midi_stream_parser parser;
 
     // Larger than any single packet MidiService delivers.
     uint8_t buffer[1024];
@@ -121,9 +128,14 @@ private:
       if (op_code != AMIDI_OPCODE_DATA || num_bytes == 0)
         continue;
 
-      const auto to_ns = [=] { return timestamp; };
-      m_processing.on_bytes_multi(
-          {buffer, buffer + num_bytes}, m_processing.timestamp<timestamp_info>(to_ns, timestamp));
+      // Packets are cut anywhere in the byte stream; the parser reassembles
+      // whole messages, each stamped with the packet that completed it.
+      const int64_t stamped = timestamp > 0 ? timestamp : system_ns();
+      const auto to_ns = [=] { return stamped; };
+      const int64_t ts = m_processing.timestamp<timestamp_info>(to_ns, timestamp);
+      parser.feed(buffer, num_bytes, [&](const uint8_t* msg, size_t size) {
+        m_processing.on_bytes({msg, msg + size}, ts);
+      });
     }
   }
 

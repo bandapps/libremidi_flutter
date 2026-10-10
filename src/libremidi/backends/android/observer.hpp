@@ -24,6 +24,13 @@ public:
     if (!configuration.has_callbacks())
       return;
 
+    // Register before taking the snapshot: snapshotting first lost a device
+    // plugged in between the two. A notification that arrives before the
+    // snapshot is complete is only noted and replayed below. (Registering
+    // while holding cache_mutex would invert the lock order with the
+    // notification, which holds the hotplug lock and then takes cache_mutex.)
+    hotplug_id = register_hotplug([this] { on_devices_changed(); });
+    bool replay = false;
     {
       std::lock_guard<std::mutex> lock(cache_mutex);
       cached_inputs = get_input_ports();
@@ -37,8 +44,11 @@ public:
           for (const auto& p : cached_outputs)
             configuration.output_added(p);
       }
+      ready = true;
+      replay = missed;
     }
-    hotplug_id = register_hotplug([this] { on_devices_changed(); });
+    if (replay)
+      on_devices_changed();
   }
 
   ~observer()
@@ -148,10 +158,15 @@ private:
     cache = std::move(current);
   }
 
-  // Runs on the MIDI thread.
+  // Runs on the MIDI thread (and once in the constructor, see there).
   void on_devices_changed()
   {
     std::lock_guard<std::mutex> lock(cache_mutex);
+    if (!ready)
+    {
+      missed = true;  // the constructor replays it once its snapshot is taken
+      return;
+    }
     report_changes(
         cached_inputs, get_input_ports(), configuration.input_added, configuration.input_removed);
     report_changes(
@@ -163,6 +178,8 @@ private:
   std::mutex cache_mutex;
   std::vector<libremidi::input_port> cached_inputs;
   std::vector<libremidi::output_port> cached_outputs;
+  bool ready = false;   // snapshot taken; guarded by cache_mutex
+  bool missed = false;  // a notification arrived before that
   int hotplug_id = -1;
 };
 }

@@ -293,6 +293,21 @@ FFI_PLUGIN_EXPORT const char* lrm_open_ticket_error(LrmOpenTicket* ticket);
 // Gives up the caller's share of the ticket.
 FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket);
 
+// -----------------------------------------------------------------------------
+// Deferred release, for garbage-collection finalizers
+// -----------------------------------------------------------------------------
+//
+// Same as lrm_midi_in_close / lrm_midi_out_close / lrm_observer_free /
+// lrm_open_ticket_release, but they only queue the object and return at once;
+// a native cleanup thread does the actual work. Closing can block (joining a
+// reader thread, a system call into the MIDI service), which a Dart
+// NativeFinalizer callback must not do. Use the immediate functions
+// everywhere else.
+FFI_PLUGIN_EXPORT void lrm_midi_in_close_deferred(LrmMidiIn* midi_in);
+FFI_PLUGIN_EXPORT void lrm_midi_out_close_deferred(LrmMidiOut* midi_out);
+FFI_PLUGIN_EXPORT void lrm_observer_free_deferred(LrmObserver* observer);
+FFI_PLUGIN_EXPORT void lrm_open_ticket_release_deferred(LrmOpenTicket* ticket);
+
 // Check if input is connected
 FFI_PLUGIN_EXPORT bool lrm_midi_in_is_connected(LrmMidiIn* midi_in);
 

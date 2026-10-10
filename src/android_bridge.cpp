@@ -15,6 +15,8 @@
 #include <pthread.h>
 
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <condition_variable>
 #include <cstdlib>
 #include <map>
@@ -84,6 +86,38 @@ JNIEnv* env()
   }
   return e;
 }
+
+// A JNIEnv for the current thread for the lifetime of this object. Uses env()
+// where it can; if the thread cannot be registered for detach-on-exit, it is
+// attached only for this scope. For teardown paths that must not give up.
+class scoped_env
+{
+public:
+  scoped_env()
+  {
+    if ((e_ = env()))
+      return;
+    if (JavaVM* vm = g_vm.load(std::memory_order_acquire))
+    {
+      if (vm->AttachCurrentThread(&e_, nullptr) == JNI_OK)
+        detach_ = vm;
+      else
+        e_ = nullptr;
+    }
+  }
+  ~scoped_env()
+  {
+    if (detach_)
+      detach_->DetachCurrentThread();
+  }
+  scoped_env(const scoped_env&) = delete;
+  scoped_env& operator=(const scoped_env&) = delete;
+  JNIEnv* get() const noexcept { return e_; }
+
+private:
+  JNIEnv* e_ = nullptr;
+  JavaVM* detach_ = nullptr;
+};
 
 // Clears a pending Java exception; returns whether there was one.
 bool clear_exception(JNIEnv* e)
@@ -162,10 +196,11 @@ public:
   ~lease() override
   {
     // The last lease can be dropped on any thread — one that shared an already
-    // open device and never needed JNI itself, or a finalizer's. Attach it
+    // open device and never needed JNI itself, or the cleanup thread. Attach it
     // first: AMidiDevice_release() aborts the process on a thread that is not
     // attached to the JVM.
-    if (JNIEnv* e = env())
+    scoped_env attached;
+    if (JNIEnv* e = attached.get())
     {
       AMidiDevice_release(device_);
       e->CallStaticVoidMethod(g_bridge, g_close_device, java_device_);
@@ -174,7 +209,8 @@ public:
     }
     else
     {
-      LOGE("closing MIDI device: no JNI environment, device stays open");
+      // Only when the JVM itself is gone, i.e. the process is ending.
+      LOGE("closing MIDI device: the JVM is unreachable, device left open");
     }
 
     {
@@ -260,10 +296,30 @@ public:
     g_send_ports_cv.notify_all();
   }
 
+  // AMidiInputPort_send() may take fewer bytes than offered when the port's
+  // buffer is full; success is only when all of them went out. A port that
+  // stays full for about 100 ms counts as failed.
   bool send(const unsigned char* data, size_t size) override
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    return AMidiInputPort_send(port_, data, size) >= 0;
+    size_t sent = 0;
+    int stalled = 0;
+    while (sent < size)
+    {
+      const ssize_t n = AMidiInputPort_send(port_, data + sent, size - sent);
+      if (n < 0)
+        return false;
+      if (n == 0)
+      {
+        if (++stalled > 100)
+          return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      sent += static_cast<size_t>(n);
+      stalled = 0;
+    }
+    return true;
   }
 
 private:

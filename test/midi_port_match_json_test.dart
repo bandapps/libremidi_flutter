@@ -82,4 +82,30 @@ void main() {
       );
     });
   });
+
+  // Equality is the connection (portId); ports without one (fromMatchJson)
+  // compare by their saved description. Before, == used stableId, which is 0
+  // for every fromMatchJson port, so any two of them were "equal" and a Set
+  // of saved selections collapsed to one entry.
+  group('MidiPort equality without a portId', () {
+    Map<String, dynamic> saved(String name) => {
+          'port_name': name,
+          'display_name': name,
+          'manufacturer': 'TestCo',
+        };
+
+    test('different saved ports are not equal', () {
+      final a = MidiPort.fromMatchJson(saved('Alpha'))!;
+      final b = MidiPort.fromMatchJson(saved('Beta'))!;
+      expect(a == b, isFalse);
+      expect({a, b}, hasLength(2));
+    });
+
+    test('the same saved port is equal, with the same hash', () {
+      final a = MidiPort.fromMatchJson(saved('Alpha'))!;
+      final b = MidiPort.fromMatchJson(saved('Alpha'))!;
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+    });
+  });
 }

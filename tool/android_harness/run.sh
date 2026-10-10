@@ -14,14 +14,18 @@ D=${1:?usage: run.sh <adb-serial> [harness.apk]}
 HERE=${0:A:h}
 LOOP=$HERE/build/midi_loopback/build/app/outputs/flutter-apk/app-debug.apk
 LOOP2=$HERE/build/midi_loopback2/build/app/outputs/flutter-apk/app-debug.apk
+SLOW=$HERE/build/midi_slowloop/build/app/outputs/flutter-apk/app-debug.apk
 APK=${2:-$HERE/build/lrm_harness/build/app/outputs/flutter-apk/app-release.apk}
 
-adb -s $D install -r $LOOP >/dev/null
-adb -s $D install -r $LOOP2 >/dev/null
-adb -s $D install -r $APK >/dev/null
+# A failed install must stop the run: otherwise whatever build is still on the
+# device runs and its results look like this build's.
+for apk in $LOOP $LOOP2 $SLOW $APK; do
+  adb -s $D install -r $apk >/dev/null || { echo "VERDICT: could not install $apk"; exit 1; }
+done
 adb -s $D shell am force-stop dev.test.lrm_harness
 adb -s $D shell am force-stop dev.test.midi_loopback
 adb -s $D shell am force-stop dev.test.midi_loopback2
+adb -s $D shell am force-stop dev.test.midi_slowloop
 adb -s $D logcat -c
 adb -s $D shell am start -n dev.test.lrm_harness/.MainActivity >/dev/null
 
@@ -61,6 +65,9 @@ LOG=$(adb -s $D logcat -d)
 echo "$LOG" | grep -E "HARNESS|Fatal signal|Abort message|HWAddressSanitizer"
 echo "--- connections at DONE: ${CONN_DONE:-?}, after the orphan was collected: ${CONN_GC:-?}"
 echo "--- process after the probe: ${ALIVE:-DEAD}"
+
+# The 7 s device would slow down every other app (and test) on the device.
+adb -s $D uninstall dev.test.midi_slowloop >/dev/null 2>&1
 
 # Verdict, as exit status: 0 only if every check holds.
 fail=0

@@ -1,10 +1,14 @@
 package dev.celtera.libremidi;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.content.res.XmlResourceParser;
 import android.media.midi.MidiDevice;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
+import android.media.midi.MidiDeviceService;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -13,6 +17,10 @@ import android.util.Log;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -37,6 +45,11 @@ public final class MidiBridge {
     private static final Object lock = new Object();
     private static MidiManager manager;
     private static Handler handler;
+    // "manufacturer|product" of every virtual device this app provides itself
+    // through a MidiDeviceService. Written once in init.
+    private static Set<String> ownDevices = new HashSet<>();
+    // Opens still in progress in MidiService, by device id. Guarded by lock.
+    private static final Map<Integer, PendingOpen> pending = new HashMap<>();
 
     private MidiBridge() {}
 
@@ -56,6 +69,7 @@ public final class MidiBridge {
                 Log.w(TAG, "MidiManager unavailable");
                 return;
             }
+            ownDevices = readOwnDevices(app);
             HandlerThread thread = new HandlerThread("libremidi");
             thread.start();
             handler = new Handler(thread.getLooper());
@@ -130,6 +144,12 @@ public final class MidiBridge {
      * The caller owns the returned device and must hand it back to
      * {@link #closeDevice}. Must not be called on the MIDI thread, which
      * delivers the result.
+     *
+     * An open that times out is not abandoned: MidiService may still be
+     * connecting (Bluetooth binding can be slow). The next call for the same
+     * device joins it instead of starting a second open, which MidiService
+     * would reject while the first is still binding, and receives the device
+     * if it arrives. Only a device that arrives with nobody waiting is closed.
      */
     static Object openDevice(int deviceId, long timeoutMs) {
         MidiManager m = manager();
@@ -147,20 +167,116 @@ public final class MidiBridge {
         }
         if (info == null) return "device is no longer connected";
 
-        final OpenResult result = new OpenResult();
-        m.openDevice(info, device -> result.complete(device), handler);
+        // A MidiDeviceService of this app is started on the main thread, which
+        // is blocked here while we wait for it: the open could never finish.
+        if (Looper.myLooper() == Looper.getMainLooper() && isOwnService(info)) {
+            return "a MIDI device provided by this app cannot be opened from the main "
+                    + "thread; use openInputAsync/openOutputAsync";
+        }
 
-        boolean done;
+        PendingOpen open;
+        boolean start = false;
+        synchronized (lock) {
+            open = pending.get(deviceId);
+            if (open == null) {
+                open = new PendingOpen();
+                pending.put(deviceId, open);
+                start = true;
+            }
+            open.waiters++;
+        }
+        if (start) {
+            final PendingOpen started = open;
+            m.openDevice(info, device -> complete(deviceId, started, device), handler);
+        }
+
         try {
-            done = result.latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            open.latch.await(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            done = false;
         }
-        MidiDevice device = result.takeOrAbandon(done);
-        if (!done) return "timed out waiting for the device to open";
-        if (device == null) return "the system could not open the device";
-        return device;
+
+        synchronized (lock) {
+            open.waiters--;
+            // Decided by the result, not by whether await() timed out: a device
+            // that arrived just as the wait ran out is still taken here rather
+            // than left unclaimed.
+            if (!open.done) {
+                // Still connecting. It stays pending: the next call joins it,
+                // and if nobody is waiting when it completes, complete() closes
+                // the device.
+                return "timed out waiting for the device to open";
+            }
+            if (open.claimed) return "the device is being opened by another caller";
+            open.claimed = true;
+            pending.remove(deviceId);
+            if (open.device == null) return "the system could not open the device";
+            return open.device;
+        }
+    }
+
+    // Runs on the MIDI thread when MidiService has answered.
+    private static void complete(int deviceId, PendingOpen open, MidiDevice device) {
+        synchronized (lock) {
+            open.done = true;
+            open.device = device;
+            if (open.waiters == 0) {
+                // Everyone gave up; nobody will take it.
+                pending.remove(deviceId);
+                open.claimed = true;
+                closeDevice(device);
+            }
+        }
+        open.latch.countDown();
+    }
+
+    private static boolean isOwnService(MidiDeviceInfo info) {
+        if (info.getType() != MidiDeviceInfo.TYPE_VIRTUAL) return false;
+        Set<String> own;
+        synchronized (lock) {
+            own = ownDevices;
+        }
+        Bundle p = info.getProperties();
+        return !own.isEmpty() && own.contains(deviceKey(
+                str(p, MidiDeviceInfo.PROPERTY_MANUFACTURER),
+                str(p, MidiDeviceInfo.PROPERTY_PRODUCT)));
+    }
+
+    // Manufacturer and product, which MidiService copies from the service's
+    // device description into the MidiDeviceInfo properties.
+    private static String deviceKey(String manufacturer, String product) {
+        return manufacturer + "|" + product;
+    }
+
+    /**
+     * Reads the &lt;device&gt; entries of this app's own MidiDeviceServices from
+     * their meta-data, the same description MidiService builds the
+     * MidiDeviceInfo properties from.
+     */
+    private static Set<String> readOwnDevices(Context app) {
+        Set<String> devices = new HashSet<>();
+        PackageManager pm = app.getPackageManager();
+        Intent intent = new Intent(MidiDeviceService.SERVICE_INTERFACE).setPackage(app.getPackageName());
+        for (ResolveInfo r : pm.queryIntentServices(intent, PackageManager.GET_META_DATA)) {
+            if (r.serviceInfo == null) continue;
+            try (XmlResourceParser xml =
+                         r.serviceInfo.loadXmlMetaData(pm, MidiDeviceService.SERVICE_INTERFACE)) {
+                if (xml == null) continue;
+                for (int ev = xml.getEventType(); ev != XmlResourceParser.END_DOCUMENT; ev = xml.next()) {
+                    if (ev == XmlResourceParser.START_TAG && "device".equals(xml.getName())) {
+                        devices.add(deviceKey(attr(xml, "manufacturer"), attr(xml, "product")));
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "could not read this app's MIDI device description", e);
+            }
+        }
+        return devices;
+    }
+
+    private static String attr(XmlResourceParser xml, String name) {
+        String v = xml.getAttributeValue(null, name);
+        return v != null ? v : "";
     }
 
     /** Closes a device obtained from {@link #openDevice}. */
@@ -173,33 +289,12 @@ public final class MidiBridge {
         }
     }
 
-    /**
-     * Hand-over of an asynchronous open. If the waiter gives up first, a device
-     * that still arrives later is closed here instead of being leaked.
-     */
-    private static final class OpenResult {
+    /** An open in progress in MidiService. Fields guarded by {@link #lock}. */
+    private static final class PendingOpen {
         final CountDownLatch latch = new CountDownLatch(1);
-        private MidiDevice device;
-        private boolean abandoned;
-
-        synchronized void complete(MidiDevice d) {
-            if (abandoned) {
-                closeDevice(d);
-            } else {
-                device = d;
-            }
-            latch.countDown();
-        }
-
-        synchronized MidiDevice takeOrAbandon(boolean done) {
-            if (done) return device;
-            abandoned = true;
-            if (device != null) {
-                // Arrived between the timeout and this call.
-                closeDevice(device);
-                device = null;
-            }
-            return null;
-        }
+        int waiters;
+        boolean done;
+        boolean claimed;
+        MidiDevice device;
     }
 }

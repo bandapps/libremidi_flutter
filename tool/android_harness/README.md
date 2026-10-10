@@ -29,6 +29,10 @@ input cleaned up, the process alive. Any other exit status blocks a release.
 |---|---|
 | note and 200-byte SysEx round trip, six times | broken open, send or receive path |
 | first open of a stopped device, input and output together | MidiService rejecting the second connection while it binds the service (Bluetooth MIDI behaves the same) |
+| first open of a device that takes 7 s to start, then an immediate retry | a retry racing the open MidiService is still binding |
+| synchronous open of a device provided by the app itself, from the main thread | an open that can never finish instead of a clear error |
+| a note sent in pieces with a clock byte between and running status after | input decoded per packet instead of as a byte stream |
+| `handleAddress` used after its `MidiOutput` was garbage-collected | the native output freed under another plugin |
 | `refresh()` ×2000 on the main thread and on a worker isolate | JNI local reference leaks (the table holds 512 on API 29) |
 | round trip from a worker isolate, then 70 s idle | threads exiting while attached to the JVM |
 | main isolate and worker opening/closing the same device 50× in parallel | shared device and send-port bookkeeping |

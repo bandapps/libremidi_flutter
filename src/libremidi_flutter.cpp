@@ -31,6 +31,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <functional>
+#include <deque>
+#include <condition_variable>
 #include <unordered_map>
 #include <algorithm>
 #include <mutex>
@@ -44,6 +47,8 @@ struct DartPortSink {
     LrmPostCObject post;
     int64_t port;
 };
+static void post_midi_to_port(void* context, const uint8_t* data, size_t length,
+                              int64_t timestamp);
 
 // =============================================================================
 // API selection — prefer WinMIDI (MIDI 2.0), fall back to platform default
@@ -126,27 +131,23 @@ static uint64_t public_port_id(const PortType& port) {
     // two identical devices apart — hashing the descriptive strings did not,
     // and opening the second of two identical controllers opened the first.
     // A reconnected device gets a new id; recognising it again is what
-    // stableId / toMatchJson / findClosestPort are for.
-    if (port.api == libremidi::API::ANDROID_AMIDI) {
-        return static_cast<uint64_t>(port.port);
-    }
-
+    // stableId / toMatchJson / findClosestPort are for. So Android, like the
+    // remaining backends, uses port.port as it is.
     return static_cast<uint64_t>(port.port);
 }
 
-// Why the last open on this thread failed, for lrm_get_last_error(). Only the
-// Android backend reports reasons; everywhere else this is empty and inert.
-// Constructed at the start of every open so a stale reason from an earlier
-// failure is never reported for a later one.
-// Reason recorded by the last failed open on this thread, or "".
-static std::string current_open_error() {
+// Reason recorded by the last failed open on this thread, or "". Only the
+// Android backend reports reasons. Valid until the next open on this thread.
+static const char* current_open_error() {
 #if defined(__ANDROID__)
     return libremidi::android::last_error();
 #else
-    return {};
+    return "";
 #endif
 }
 
+// Clears the reason at the start of every open, so a stale reason from an
+// earlier failure is never reported for a later one, and records a new one.
 struct OpenErrorScope {
     OpenErrorScope() {
 #if defined(__ANDROID__)
@@ -177,6 +178,10 @@ struct LrmObserver {
     // waits for a running callback, and a callback that re-entered the
     // half-destroyed observer crashed (reproduced on Android).
     std::atomic<bool> ports_stale{false};
+    // The backend could not set up hotplug (e.g. WinMIDI without its endpoint
+    // watcher) and the observer was rebuilt without it. Written in the
+    // constructor only.
+    bool hotplug_failed = false;
 
     LrmObserver(LrmHotplugCallback callback = nullptr, void* context = nullptr)
         : hotplug_callback(callback), hotplug_context(context)
@@ -208,12 +213,24 @@ struct LrmObserver {
 
         // WinMIDI if available, otherwise platform default (WinUWP, CoreMIDI, ALSA...)
         auto api = get_preferred_api();
-        auto api_conf = libremidi::observer_configuration_for(api);
-        libremidi::set_client_name(api_conf, kInternalClientName);
-        observer = std::make_unique<libremidi::observer>(
-            std::move(config),
-            std::move(api_conf)
-        );
+        auto make = [api](libremidi::observer_configuration conf) {
+            auto api_conf = libremidi::observer_configuration_for(api);
+            libremidi::set_client_name(api_conf, kInternalClientName);
+            return std::make_unique<libremidi::observer>(std::move(conf), std::move(api_conf));
+        };
+        try {
+            observer = make(config);
+        } catch (...) {
+            if (!hotplug_callback) throw;
+            // The backend refused hotplug; keep enumeration working without it
+            // and report it through lrm_observer_hotplug_available.
+            libremidi::observer_configuration plain;
+            plain.track_hardware = true;
+            plain.track_virtual = true;
+            plain.notify_in_constructor = true;
+            observer = make(std::move(plain));
+            hotplug_failed = true;
+        }
         refreshInternal();
     }
 
@@ -437,10 +454,16 @@ struct LrmMidiIn {
                 return;
             // libremidi reuses a single message buffer: it is cleared as soon as
             // this synchronous callback returns and overwritten for every further
-            // message in the same packet. The Dart side is a
-            // NativeCallable.listener that reads the bytes later on the event
-            // loop, so hand it an owning heap copy and let it release the copy
-            // via lrm_free once it has been read.
+            // message in the same packet. Port delivery copies the bytes into
+            // the Dart heap inside the post, i.e. before that, so it reads the
+            // buffer directly.
+            if (callback == post_midi_to_port) {
+                post_midi_to_port(context, msg.bytes.data(), size, msg.timestamp);
+                return;
+            }
+            // A plain LrmMidiCallback may read the bytes later (a Dart
+            // NativeCallable.listener does), so it gets an owning heap copy,
+            // released via lrm_free once read.
             auto* copy = claim_message_buffer(size, this);
             if (!copy)
                 return;
@@ -512,11 +535,7 @@ extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_version(void) {
 }
 
 extern "C" FFI_PLUGIN_EXPORT const char* lrm_get_last_error(void) {
-#if defined(__ANDROID__)
-    return libremidi::android::last_error();
-#else
-    return "";
-#endif
+    return current_open_error();
 }
 
 // Free a heap buffer handed to Dart by the input callback. Ignores a pointer
@@ -577,10 +596,9 @@ static void post_midi_to_port(void* context, const uint8_t* data, size_t length,
     message.type = Dart_CObject_kArray;
     message.value.as_array.length = 2;
     message.value.as_array.values = items;
-    // The post copies the bytes into the Dart heap, so the buffer the callback
-    // path allocated for them can go right away.
+    // The post copies the bytes into the Dart heap; `data` is libremidi's own
+    // buffer and stays with it (see LrmMidiIn's on_message).
     sink->post(sink->port, &message);
-    lrm_free(const_cast<uint8_t*>(data));
 }
 
 // =============================================================================
@@ -636,9 +654,9 @@ extern "C" FFI_PLUGIN_EXPORT bool lrm_observer_hotplug_available(LrmObserver* ob
     return libremidi::android::midi_available();
 #else
     // These backends register their hotplug callbacks with the libremidi
-    // observer itself, which throws on failure, so reaching this point with a
-    // callback installed means notifications can be delivered.
-    return true;
+    // observer itself, which throws on failure (WinMIDI through our patched
+    // backend); the constructor then rebuilt it without hotplug.
+    return !observer->hotplug_failed;
 #endif
 }
 
@@ -784,11 +802,6 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiOut* lrm_midi_out_open_by_id(LrmObserver* ob
     if (!observer) return nullptr;
 
     OpenErrorScope open_error;
-#if defined(__ANDROID__)
-    // Android hands a reconnected device a new device id, which is part of the
-    // port handle. Re-enumerate so the id resolves to the current handle.
-    observer->refresh();
-#endif
 
     libremidi::output_port port;
     if (!observer->getOutputPortById(port_id, port)) {
@@ -871,11 +884,7 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id(
 ) {
     if (!observer) return nullptr;
 
-    // See lrm_midi_out_open_by_id.
     OpenErrorScope open_error;
-#if defined(__ANDROID__)
-    observer->refresh();
-#endif
 
     libremidi::input_port port;
     if (!observer->getInputPortById(port_id, port)) {
@@ -928,17 +937,11 @@ extern "C" FFI_PLUGIN_EXPORT LrmMidiIn* lrm_midi_in_open_by_id_with_port(
 // Resolve a port id against the observer for the asynchronous open.
 static bool resolve_input_port(LrmObserver* observer, uint64_t port_id,
                                libremidi::input_port& port) {
-#if defined(__ANDROID__)
-    observer->refresh();  // see lrm_midi_out_open_by_id
-#endif
     return observer->getInputPortById(port_id, port);
 }
 
 static bool resolve_output_port(LrmObserver* observer, uint64_t port_id,
                                 libremidi::output_port& port) {
-#if defined(__ANDROID__)
-    observer->refresh();
-#endif
     return observer->getOutputPortById(port_id, port);
 }
 
@@ -1083,4 +1086,79 @@ extern "C" FFI_PLUGIN_EXPORT const char* lrm_open_ticket_error(LrmOpenTicket* ti
 
 extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket) {
     if (ticket) release_open_ticket(ticket);
+}
+
+// =============================================================================
+// Deferred release
+// =============================================================================
+//
+// See the header. One cleanup thread, started on first use, works through the
+// queue for the rest of the process. The queue itself is never destroyed, so
+// a finalizer that runs while the process is exiting cannot touch a dead
+// object. Must stay in sync with the other native copy.
+namespace {
+class DeferredReleaser {
+public:
+    void post(std::function<void()> release) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(std::move(release));
+            if (!started_) {
+                started_ = true;
+                std::thread([this] { run(); }).detach();
+            }
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> release;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !queue_.empty(); });
+                release = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            release();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> queue_;
+    bool started_ = false;
+};
+
+DeferredReleaser& deferred_releaser() {
+    static auto* releaser = new DeferredReleaser();  // intentionally never freed
+    return *releaser;
+}
+
+template <typename T>
+void release_later(T* object, void (*release)(T*)) {
+    if (!object) return;
+    try {
+        deferred_releaser().post([object, release] { release(object); });
+    } catch (...) {
+        release(object);  // out of memory: better to block than to leak
+    }
+}
+}  // namespace
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_midi_in_close_deferred(LrmMidiIn* midi_in) {
+    release_later(midi_in, lrm_midi_in_close);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_midi_out_close_deferred(LrmMidiOut* midi_out) {
+    release_later(midi_out, lrm_midi_out_close);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_observer_free_deferred(LrmObserver* observer) {
+    release_later(observer, lrm_observer_free);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release_deferred(LrmOpenTicket* ticket) {
+    release_later(ticket, lrm_open_ticket_release);
 }

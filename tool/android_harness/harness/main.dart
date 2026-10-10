@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:ffi/ffi.dart' show malloc;
+
+import 'package:flutter/material.dart' hide Size;
 import 'package:libremidi_flutter/libremidi_flutter.dart';
 
 // Release-build harness for libremidi_flutter on Android. Results go to
@@ -203,6 +206,112 @@ Future<void> run() async {
         'async open round trip');
   });
 
+  // A device whose service takes 7 s to start: the first open times out at
+  // 5 s, an immediate retry must join the open still in progress and get the
+  // device. Without that, the retry started a second open, which MidiService
+  // rejects while it is still binding the service.
+  await guarded('slow device', () async {
+    final slow = obs.getOutputPorts().where((p) => p.displayName.startsWith('SlowLoop')).toList();
+    check(slow.isNotEmpty, 'slow loopback listed');
+    if (slow.isEmpty) return;
+    var first = 'opened';
+    try {
+      (await obs.openOutputAsync(slow.first)).dispose();
+    } on MidiException catch (e) {
+      first = e.message;
+    }
+    check(first.contains('timed out'), 'first open of a 7 s device times out ($first)');
+    final out = await obs.openOutputAsync(slow.first);
+    out.send(MidiMessageBuilder.noteOn(channel: 0, note: 2, velocity: 2));
+    out.dispose();
+    check(true, 'retry received the device that was still opening');
+  });
+
+  // A virtual device provided by this app: opening it synchronously from the
+  // main thread can never finish (its service starts on that same thread), so
+  // it must fail at once with a reason; the async open works.
+  await guarded('own device', () async {
+    final own = obs.getOutputPorts().where((p) => p.displayName.startsWith('OwnLoop')).toList();
+    check(own.isNotEmpty, "app's own virtual device listed");
+    if (own.isEmpty) return;
+    final watch = Stopwatch()..start();
+    var message = 'opened';
+    try {
+      obs.openOutput(own.first).dispose();
+    } on MidiException catch (e) {
+      message = e.message;
+    }
+    check(message.contains('provided by this app') && watch.elapsedMilliseconds < 1000,
+        'sync open of own device refused at once (${watch.elapsedMilliseconds} ms: $message)');
+    final out = await obs.openOutputAsync(own.first);
+    out.dispose();
+    check(true, 'own device opens asynchronously');
+  });
+
+  // A message that arrives in pieces — status in one packet, data in the
+  // next, a clock byte in between, then running status — must come out as
+  // whole messages. The loopback echoes every send as its own packet.
+  await guarded('fragmented input', () async {
+    final pair = loopPair(obs)!;
+    final input = obs.openInput(pair.$1, receiveTiming: true);
+    final output = obs.openOutput(pair.$2);
+    final got = <MidiMessage>[];
+    final sub = input.messages.listen(got.add);
+    for (final piece in [
+      [0x93],
+      [0x30],
+      [0xF8],
+      [0x50],
+      [0x31, 0x51], // running status: another note on, channel 4
+    ]) {
+      output.send(Uint8List.fromList(piece));
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    await sub.cancel();
+    input.dispose();
+    output.dispose();
+    final notes = got.where((m) => m.isNoteOn).map((m) => m.data.toList()).toList();
+    final clocks = got.where((m) => m.status == 0xF8).length;
+    check(
+        notes.length == 2 &&
+            notes[0].join(',') == '147,48,80' &&
+            notes[1].join(',') == '147,49,81' &&
+            clocks == 1 &&
+            got.length == 3,
+        'fragmented input reassembled ($notes, clocks $clocks, total ${got.length})');
+  });
+
+  // Cross-plugin bridging: another plugin gets the raw pointer through
+  // handleAddress and the MidiOutput object itself is dropped. The garbage
+  // collector must not free the native output underneath that plugin.
+  await guarded('handleAddress', () async {
+    final pair = loopPair(obs)!;
+    final input = obs.openInput(pair.$1);
+    final got = <MidiMessage>[];
+    final sub = input.messages.listen(got.add);
+    final address = obs.openOutput(pair.$2).handleAddress; // object dropped
+    await collectGarbage();
+
+    final lib = DynamicLibrary.open('liblibremidi_flutter.so');
+    final send = lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Uint8>, Size),
+        int Function(Pointer<Void>, Pointer<Uint8>, int)>('lrm_midi_out_send');
+    final close = lib.lookupFunction<Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)>('lrm_midi_out_close');
+    final bytes = malloc<Uint8>(3);
+    bytes[0] = 0x9E; // note on, channel 15
+    bytes[1] = 44;
+    bytes[2] = 4;
+    final result = send(Pointer.fromAddress(address), bytes, 3);
+    malloc.free(bytes);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    close(Pointer.fromAddress(address)); // the other plugin is done
+    await sub.cancel();
+    input.dispose();
+    check(result == 0 && got.any((m) => m.note == 44 && m.channel == 14),
+        'raw handle still valid after its MidiOutput was collected (send $result)');
+  });
+
   // Two identical devices (same name, manufacturer, product, no serial) must
   // be told apart: distinct port ids, and a message sent to the second one
   // arrives on the second one only.
@@ -215,6 +324,7 @@ Future<void> run() async {
     check(ins[0].stableId == ins[1].stableId,
         'the two devices are indistinguishable by their data');
     check(ins[0].portId != ins[1].portId, 'identical devices have distinct port ids');
+    check({ins[0], ins[1]}.length == 2, 'identical devices are different MidiPorts (==)');
     final inA = obs.openInput(ins[0]);
     final inB = obs.openInput(ins[1]);
     final outB = obs.openOutput(outs.firstWhere((o) => deviceOf(o) == deviceOf(ins[1])));

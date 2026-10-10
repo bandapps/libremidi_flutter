@@ -58,18 +58,23 @@ MidiException _openFailure(String what, [String? reason]) {
 }
 
 // Native cleanup for objects whose owner never called dispose() — typically
-// because their isolate ended or the app was hot restarted. Each runs the
+// because their isolate ended or the app was hot restarted. Each queues the
 // matching close/free once the Dart object has been garbage collected or the
 // isolate group shuts down; dispose() detaches it, so nothing is freed twice.
+// The *_deferred functions only queue the object for a native cleanup thread:
+// closing can block, which a finalizer callback must not.
 // An input stays reachable through its receive port while that port is open,
 // so an input still in use is never finalized.
 NativeFinalizer _finalizerFor(String symbol) => NativeFinalizer(
     _dylib.lookup<NativeFunction<Void Function(Pointer<Void>)>>(symbol));
-final NativeFinalizer _observerFinalizer = _finalizerFor('lrm_observer_free');
-final NativeFinalizer _inputFinalizer = _finalizerFor('lrm_midi_in_close');
-final NativeFinalizer _outputFinalizer = _finalizerFor('lrm_midi_out_close');
+final NativeFinalizer _observerFinalizer =
+    _finalizerFor('lrm_observer_free_deferred');
+final NativeFinalizer _inputFinalizer = _finalizerFor('lrm_midi_in_close_deferred');
+final NativeFinalizer _outputFinalizer =
+    _finalizerFor('lrm_midi_out_close_deferred');
 
-final NativeFinalizer _ticketFinalizer = _finalizerFor('lrm_open_ticket_release');
+final NativeFinalizer _ticketFinalizer =
+    _finalizerFor('lrm_open_ticket_release_deferred');
 
 /// The caller's share of a native asynchronous open (see `LrmOpenTicket` in
 /// the header). If the awaiting isolate ends before the open finishes, this
@@ -338,16 +343,35 @@ class MidiPort {
   String toString() =>
       'MidiPort($displayName, ${isInput ? "input" : "output"}, ${transportType.displayName})';
 
+  /// Two ports are equal when they are the same connection: the same
+  /// [portId] in the same direction. Two identical devices (same name, no
+  /// serial number) are therefore different ports, as they are to the OS.
+  ///
+  /// This is not "the same device after reconnecting" — a reconnected device
+  /// may get a new [portId] (always on Android). For that, compare [stableId]
+  /// or restore a selection with [toMatchJson] and
+  /// [MidiObserver.findClosestPort].
+  ///
+  /// Ports from [fromMatchJson] have no [portId]; they are compared by the
+  /// saved description instead.
   @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is MidiPort &&
-          runtimeType == other.runtimeType &&
-          stableId == other.stableId &&
-          isInput == other.isInput;
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! MidiPort || isInput != other.isInput) return false;
+    if (portId != 0 || other.portId != 0) return portId == other.portId;
+    return portName == other.portName &&
+        displayName == other.displayName &&
+        deviceName == other.deviceName &&
+        manufacturer == other.manufacturer &&
+        product == other.product &&
+        serial == other.serial;
+  }
 
   @override
-  int get hashCode => stableId.hashCode ^ isInput.hashCode;
+  int get hashCode => portId != 0
+      ? Object.hash(portId, isInput)
+      : Object.hash(portName, displayName, deviceName, manufacturer, product,
+          serial, isInput);
 }
 
 // =============================================================================
@@ -896,9 +920,15 @@ class MidiObserver implements Finalizable {
   /// hotplug events (unlike index-based lookup).
   ///
   /// Returns once the port is open, so it can be sent to right away; throws a
-  /// [MidiException] otherwise. On Android, opening a Bluetooth or virtual
-  /// device for the first time can take a moment while the system connects
-  /// it (at most 5 seconds before giving up).
+  /// [MidiException] otherwise.
+  ///
+  /// **On Android, prefer [openOutputAsync].** Opening a Bluetooth or virtual
+  /// device can take a while — Android gives up after 5 seconds, and a second
+  /// open of the same device first waits for the one in progress. Since
+  /// Flutter 3.29 the UI isolate runs on Android's main thread, so this call
+  /// freezes the app for that long and can trigger an "app not responding"
+  /// dialog. A virtual device provided by the app itself cannot be opened from
+  /// the main thread at all; this call then fails and says so.
   MidiOutput openOutput(MidiPort port) {
     _checkDisposed();
     if (port.isInput) {
@@ -915,8 +945,8 @@ class MidiObserver implements Finalizable {
   /// By default, SysEx messages are received, while timing (MIDI clock) and
   /// active sensing messages are filtered out.
   ///
-  /// Returns once the port is open; see [openOutput] for how long that can
-  /// take on Android.
+  /// Returns once the port is open. **On Android, prefer [openInputAsync]**;
+  /// see [openOutput] for why.
   MidiInput openInput(
     MidiPort port, {
     bool receiveSysex = true,
@@ -1320,7 +1350,18 @@ class MidiOutput implements Finalizable {
   /// Use with `Pointer<LrmMidiOut>.fromAddress(address)` in another
   /// FFI plugin that shares the same [LrmMidiOut] struct layout.
   /// Returns 0 if disposed.
-  int get handleAddress => _disposed ? 0 : (_handle?.address ?? 0);
+  ///
+  /// Once read, the native output stays valid until [dispose] is called, even
+  /// if this object is no longer referenced: reading the address turns off the
+  /// automatic cleanup on garbage collection, because Dart cannot see that
+  /// another plugin still holds the pointer. Call [dispose] when done.
+  int get handleAddress {
+    if (_disposed) return 0;
+    final handle = _handle;
+    if (handle == null) return 0;
+    _outputFinalizer.detach(this);
+    return handle.address;
+  }
 
   void _checkDisposed() {
     if (_disposed) {
@@ -1856,6 +1897,10 @@ class LibremidiFlutter {
     final MidiOutput output;
     try {
       output = await _ensureObserver.openOutputAsync(port);
+    } catch (_) {
+      // After dispose() the open is abandoned whatever its own outcome.
+      if (generation != _generation) throw _disposedWhileOpening();
+      rethrow;
     } finally {
       if (generation == _generation) _openingOutputs.remove(id);
     }
@@ -1890,6 +1935,9 @@ class LibremidiFlutter {
         receiveTiming: receiveTiming,
         receiveSensing: receiveSensing,
       );
+    } catch (_) {
+      if (generation != _generation) throw _disposedWhileOpening();
+      rethrow;
     } finally {
       if (generation == _generation) _openingInputs.remove(id);
     }

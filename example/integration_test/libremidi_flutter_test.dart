@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -16,6 +17,25 @@ import 'package:libremidi_flutter/libremidi_flutter.dart';
 MidiPort? safeTestInput(MidiObserver observer) {
   for (final port in observer.getInputPorts()) {
     if (port.isVirtual) return port;
+  }
+  return null;
+}
+
+/// An input and an output of the same virtual loopback device, or null.
+///
+/// Same display name is the criterion on most platforms (the macOS IAC bus).
+/// On Android, several identical virtual devices can be installed, so the two
+/// ports must also belong to the same device: the port id carries the device
+/// id in its upper 32 bits there.
+(MidiPort, MidiPort)? virtualLoopbackPair(
+  List<MidiPort> inputs,
+  List<MidiPort> outputs,
+) {
+  for (final i in inputs.where((p) => p.isVirtual)) {
+    for (final o in outputs.where((p) => p.isVirtual)) {
+      final sameDevice = !Platform.isAndroid || (i.portId >> 32) == (o.portId >> 32);
+      if (o.displayName == i.displayName && sameDevice) return (i, o);
+    }
   }
   return null;
 }
@@ -400,16 +420,10 @@ void main() {
     testWidgets('a message sent to a loopback arrives intact', (tester) async {
       final observer = MidiObserver();
       try {
-        MidiPort? inPort;
-        MidiPort? outPort;
-        for (final i in observer.getInputPorts().where((p) => p.isVirtual)) {
-          for (final o in observer.getOutputPorts().where((p) => p.isVirtual)) {
-            if (o.displayName == i.displayName) {
-              inPort = i;
-              outPort = o;
-            }
-          }
-        }
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final inPort = pair?.$1;
+        final outPort = pair?.$2;
         if (inPort == null || outPort == null) {
           markTestSkipped('no virtual loopback port pair available');
           return;
@@ -448,23 +462,17 @@ void main() {
       }
     });
 
-    // openInputAsync/openOutputAsync open on a helper isolate and hand the
-    // ports back to this one; without this test a break in that hand-over
-    // (wrong isolate owning the port, handle not adopted) would only show up
-    // in an app. Same loopback requirement as above.
+    // openInputAsync/openOutputAsync open on a native thread and hand the
+    // ports back to this isolate; without this test a break in that hand-over
+    // (ticket not taken, handle not adopted, messages posted to the wrong
+    // port) would only show up in an app. Same loopback requirement as above.
     testWidgets('ports opened asynchronously carry messages', (tester) async {
       final observer = MidiObserver();
       try {
-        MidiPort? inPort;
-        MidiPort? outPort;
-        for (final i in observer.getInputPorts().where((p) => p.isVirtual)) {
-          for (final o in observer.getOutputPorts().where((p) => p.isVirtual)) {
-            if (o.displayName == i.displayName) {
-              inPort = i;
-              outPort = o;
-            }
-          }
-        }
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final inPort = pair?.$1;
+        final outPort = pair?.$2;
         if (inPort == null || outPort == null) {
           markTestSkipped('no virtual loopback port pair available');
           return;
@@ -473,8 +481,8 @@ void main() {
         late final MidiInput input;
         late final MidiOutput output;
         await tester.runAsync(() async {
-          input = await observer.openInputAsync(inPort!);
-          output = await observer.openOutputAsync(outPort!);
+          input = await observer.openInputAsync(inPort);
+          output = await observer.openOutputAsync(outPort);
         });
         final received = <MidiMessage>[];
         final sub = input.messages.listen(received.add);
@@ -510,14 +518,10 @@ void main() {
       // LibremidiFlutter's observer is a hotplug one, which on iOS/macOS fills
       // its port list in the background; give it a moment.
       for (var attempt = 0; attempt < 40 && inPort == null; attempt++) {
-        for (final i in LibremidiFlutter.getInputPorts().where((p) => p.isVirtual)) {
-          for (final o in LibremidiFlutter.getOutputPorts().where((p) => p.isVirtual)) {
-            if (o.displayName == i.displayName) {
-              inPort = i;
-              outPort = o;
-            }
-          }
-        }
+        final pair = virtualLoopbackPair(
+            LibremidiFlutter.getInputPorts(), LibremidiFlutter.getOutputPorts());
+        inPort = pair?.$1;
+        outPort = pair?.$2;
         if (inPort == null) {
           await tester.runAsync(
             () => Future<void>.delayed(const Duration(milliseconds: 50)),

@@ -21,6 +21,11 @@ class FakeMidiAccess extends MidiAccess {
   int openOutputCount = 0;
   int disconnectInputCount = 0;
   int disconnectOutputCount = 0;
+  final disconnectedOutputs = <MidiOutputConnection>[];
+
+  /// When set, every openOutput waits for the test to complete it.
+  bool holdOutputOpens = false;
+  final pendingOutputOpens = <Completer<MidiOutputConnection>>[];
 
   @override
   List<MidiDevice> getDevices() => devices;
@@ -29,15 +34,18 @@ class FakeMidiAccess extends MidiAccess {
   Stream<HotplugEventType> get onHotplug => hotplugController.stream;
 
   @override
-  MidiInputConnection openInput(MidiPortRef port) {
+  Future<MidiInputConnection> openInput(MidiPortRef port) async {
     openInputCount++;
     return input;
   }
 
   @override
-  MidiOutputConnection openOutput(MidiPortRef port) {
+  Future<MidiOutputConnection> openOutput(MidiPortRef port) {
     openOutputCount++;
-    return output;
+    if (!holdOutputOpens) return Future.value(output);
+    final pending = Completer<MidiOutputConnection>();
+    pendingOutputOpens.add(pending);
+    return pending.future;
   }
 
   @override
@@ -48,6 +56,7 @@ class FakeMidiAccess extends MidiAccess {
   @override
   void disconnectOutput(MidiOutputConnection output) {
     disconnectOutputCount++;
+    disconnectedOutputs.add(output);
   }
 }
 
@@ -261,5 +270,46 @@ void main() {
 
     expect(midiAccess.openInputCount, 1);
     expect(find.text('CC 7=100 ch:1'), findsOneWidget);
+  });
+
+  // Opening is asynchronous: a device picked while the previous one is still
+  // opening supersedes it. Without the generation check, the late port of the
+  // first device was installed over the second one, so sends went to the
+  // device the user had just deselected and its connection was never closed.
+  testWidgets('a port that opens after the device was switched is closed', (
+    tester,
+  ) async {
+    final midiAccess = FakeMidiAccess(devices: [
+      fakeDevice(name: 'Alpha', output: true),
+      fakeDevice(name: 'Beta', output: true),
+    ])
+      ..holdOutputOpens = true;
+    final alphaOut = FakeMidiOutputConnection();
+    final betaOut = FakeMidiOutputConnection();
+
+    await tester.pumpWidget(
+      MaterialApp(home: MidiDemoPage(midiAccess: midiAccess)),
+    );
+    await tester.pump();
+
+    await openDeviceDropdown(tester);
+    await tester.tap(find.text('Alpha').last);
+    await tester.pumpAndSettle();
+    await openDeviceDropdown(tester);
+    await tester.tap(find.text('Beta').last);
+    await tester.pumpAndSettle();
+    expect(midiAccess.pendingOutputOpens, hasLength(2));
+
+    // Beta opens first, Alpha's open only completes afterwards.
+    midiAccess.pendingOutputOpens[1].complete(betaOut);
+    await tester.pumpAndSettle();
+    midiAccess.pendingOutputOpens[0].complete(alphaOut);
+    await tester.pumpAndSettle();
+
+    expect(midiAccess.disconnectedOutputs, [alphaOut]);
+    await tester.tap(find.widgetWithText(ElevatedButton, 'Send'));
+    await tester.pump();
+    expect(betaOut.controlChanges, hasLength(1));
+    expect(alphaOut.controlChanges, isEmpty);
   });
 }

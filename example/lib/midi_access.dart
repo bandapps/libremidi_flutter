@@ -101,8 +101,10 @@ abstract class MidiAccess {
   const MidiAccess();
 
   List<MidiDevice> getDevices();
-  MidiInputConnection openInput(MidiPortRef port);
-  MidiOutputConnection openOutput(MidiPortRef port);
+  // Asynchronous: on Android, opening a Bluetooth or virtual device can take
+  // a while, and a synchronous open would freeze the UI meanwhile.
+  Future<MidiInputConnection> openInput(MidiPortRef port);
+  Future<MidiOutputConnection> openOutput(MidiPortRef port);
   Stream<HotplugEventType> get onHotplug;
   void disconnectInput(MidiInputConnection input);
   void disconnectOutput(MidiOutputConnection output);
@@ -239,16 +241,16 @@ class LibremidiMidiAccess extends MidiAccess {
   }
 
   @override
-  MidiInputConnection openInput(MidiPortRef port) {
+  Future<MidiInputConnection> openInput(MidiPortRef port) async {
     return LibremidiInputConnection(
-      LibremidiFlutter.openInput(port.nativePort! as MidiPort),
+      await LibremidiFlutter.openInputAsync(port.nativePort! as MidiPort),
     );
   }
 
   @override
-  MidiOutputConnection openOutput(MidiPortRef port) {
+  Future<MidiOutputConnection> openOutput(MidiPortRef port) async {
     return LibremidiOutputConnection(
-      LibremidiFlutter.openOutput(port.nativePort! as MidiPort),
+      await LibremidiFlutter.openOutputAsync(port.nativePort! as MidiPort),
     );
   }
 

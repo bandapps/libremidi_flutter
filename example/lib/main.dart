@@ -34,6 +34,11 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   List<MidiDevice> _devices = [];
   MidiDevice? _selectedDevice;
   bool _deviceConnected = false;
+  // Bumped whenever the connection is torn down or replaced. A connect that
+  // finishes under an older value was superseded while its ports were
+  // opening, and closes them again instead of installing them.
+  int _connectGeneration = 0;
+  bool _connecting = false;
   MidiInputConnection? _midiInput;
   MidiOutputConnection? _midiOutput;
   StreamSubscription<HotplugEventType>? _hotplugSubscription;
@@ -123,18 +128,16 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
         (d) => d.stableId == _selectedDevice!.stableId,
       );
 
-      if (!stillExists && _deviceConnected) {
+      if (!stillExists && (_deviceConnected || _connecting)) {
         statusMsg = 'Disconnected: ${_selectedDevice!.name}';
         _disconnectInput();
         _disconnectOutput();
         connected = false;
-      } else if (stillExists && !_deviceConnected) {
+      } else if (stillExists && !_deviceConnected && !_connecting) {
         newSelectedDevice = newDevices.firstWhere(
           (d) => d.stableId == _selectedDevice!.stableId,
         );
-        _connectDeviceInternal(newSelectedDevice);
-        statusMsg = 'Reconnected: ${newSelectedDevice.name}';
-        connected = true;
+        _connectAndReport(newSelectedDevice, 'Reconnected');
       } else if (stillExists && _deviceConnected) {
         newSelectedDevice = newDevices.firstWhere(
           (d) => d.stableId == _selectedDevice!.stableId,
@@ -154,37 +157,71 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     });
   }
 
-  void _connectDeviceInternal(MidiDevice device) {
-    // Open MIDI input and listen for incoming messages
-    if (device.inputPorts.isNotEmpty) {
-      final idx = _selectedInputIndex.clamp(0, device.inputPorts.length - 1);
-      try {
-        _midiInput = widget.midiAccess.openInput(device.inputPorts[idx]);
-        _midiInputSubscription = _midiInput!.messages.listen(_onMidiMessage);
-        _addInLog(
-          'Connected: ${device.name} [In ${idx + 1}/${device.inputCount}]',
-        );
-      } catch (e) {
-        _addInLog('Error ${device.name}: $e');
+  /// Opens the device's selected ports. Returns whether at least one opened,
+  /// or null if the connection was superseded meanwhile.
+  Future<bool?> _connectDeviceInternal(MidiDevice device) async {
+    final generation = ++_connectGeneration;
+    bool superseded() => !mounted || generation != _connectGeneration;
+    _connecting = true;
+    try {
+      // Open MIDI input and listen for incoming messages
+      if (device.inputPorts.isNotEmpty) {
+        final idx = _selectedInputIndex.clamp(0, device.inputPorts.length - 1);
+        try {
+          final input = await widget.midiAccess.openInput(device.inputPorts[idx]);
+          if (superseded()) {
+            widget.midiAccess.disconnectInput(input);
+            return null;
+          }
+          _midiInput = input;
+          _midiInputSubscription = input.messages.listen(_onMidiMessage);
+          _addInLog(
+            'Connected: ${device.name} [In ${idx + 1}/${device.inputCount}]',
+          );
+        } catch (e) {
+          if (superseded()) return null;
+          _addInLog('Error ${device.name}: $e');
+        }
       }
-    }
 
-    // Open MIDI output for sending messages
-    if (device.outputPorts.isNotEmpty) {
-      final idx = _selectedOutputIndex.clamp(0, device.outputPorts.length - 1);
-      try {
-        _midiOutput = widget.midiAccess.openOutput(device.outputPorts[idx]);
-        _addOutLog(
-          'Connected: ${device.name} [Out ${idx + 1}/${device.outputCount}]',
-        );
-      } catch (e) {
-        _addOutLog('Error ${device.name}: $e');
+      // Open MIDI output for sending messages
+      if (device.outputPorts.isNotEmpty) {
+        final idx = _selectedOutputIndex.clamp(0, device.outputPorts.length - 1);
+        try {
+          final output =
+              await widget.midiAccess.openOutput(device.outputPorts[idx]);
+          if (superseded()) {
+            widget.midiAccess.disconnectOutput(output);
+            return null;
+          }
+          _midiOutput = output;
+          _addOutLog(
+            'Connected: ${device.name} [Out ${idx + 1}/${device.outputCount}]',
+          );
+        } catch (e) {
+          if (superseded()) return null;
+          _addOutLog('Error ${device.name}: $e');
+        }
+      } else {
+        // Without this the app looked connected while every send silently did
+        // nothing, because _sendNote() returns early on a null output.
+        _addOutLog('${device.name} has no output port — nothing to send to');
       }
-    } else {
-      // Without this the app looked connected while every send silently did
-      // nothing, because _sendNote() returns early on a null output.
-      _addOutLog('${device.name} has no output port — nothing to send to');
+      return _midiInput != null || _midiOutput != null;
+    } finally {
+      if (generation == _connectGeneration) _connecting = false;
     }
+  }
+
+  /// Connects and updates the UI when done, logging [verb] on success.
+  Future<void> _connectAndReport(MidiDevice device, [String? verb]) async {
+    final connected = await _connectDeviceInternal(device);
+    if (connected == null || !mounted) return;
+    if (connected && verb != null) {
+      _addOutLog('$verb: ${device.name}');
+      _addInLog('$verb: ${device.name}');
+    }
+    setState(() => _deviceConnected = connected);
   }
 
   void _onMidiMessage(MidiMessage msg) {
@@ -217,16 +254,11 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
     _selectedInputIndex = 0;
     _selectedOutputIndex = 0;
 
-    bool connected = false;
-    if (device != null) {
-      _connectDeviceInternal(device);
-      connected = _midiInput != null || _midiOutput != null;
-    }
-
     setState(() {
       _selectedDevice = device;
-      _deviceConnected = connected;
+      _deviceConnected = false;
     });
+    if (device != null) _connectAndReport(device);
   }
 
   String _formatMidiMessage(MidiMessage msg) {
@@ -670,14 +702,14 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
 
     _disconnectInput();
     _disconnectOutput();
-
-    _connectDeviceInternal(device);
-    setState(() {
-      _deviceConnected = _midiInput != null || _midiOutput != null;
-    });
+    setState(() => _deviceConnected = false);
+    _connectAndReport(device);
   }
 
   void _disconnectInput() {
+    // Anything still opening belongs to the connection being torn down.
+    _connectGeneration++;
+    _connecting = false;
     _midiInputSubscription?.cancel();
     _midiInputSubscription = null;
     if (_midiInput != null) {
@@ -687,6 +719,8 @@ class _MidiDemoPageState extends State<MidiDemoPage> {
   }
 
   void _disconnectOutput() {
+    _connectGeneration++;
+    _connecting = false;
     if (_midiOutput != null) {
       widget.midiAccess.disconnectOutput(_midiOutput!);
       _midiOutput = null;

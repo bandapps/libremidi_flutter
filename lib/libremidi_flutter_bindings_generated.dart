@@ -113,6 +113,28 @@ class LibremidiFlutterBindings {
   late final _lrm_midi_in_close =
       _lrm_midi_in_closePtr.asFunction<void Function(ffi.Pointer<LrmMidiIn>)>();
 
+  /// -----------------------------------------------------------------------------
+  /// Deferred release, for garbage-collection finalizers
+  /// -----------------------------------------------------------------------------
+  ///
+  /// Same as lrm_midi_in_close / lrm_midi_out_close / lrm_observer_free /
+  /// lrm_open_ticket_release, but they only queue the object and return at once;
+  /// a native cleanup thread does the actual work. Closing can block (joining a
+  /// reader thread, a system call into the MIDI service), which a Dart
+  /// NativeFinalizer callback must not do. Use the immediate functions
+  /// everywhere else.
+  void lrm_midi_in_close_deferred(ffi.Pointer<LrmMidiIn> midi_in) {
+    return _lrm_midi_in_close_deferred(midi_in);
+  }
+
+  late final _lrm_midi_in_close_deferredPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmMidiIn>)>>(
+        'lrm_midi_in_close_deferred',
+      );
+  late final _lrm_midi_in_close_deferred =
+      _lrm_midi_in_close_deferredPtr
+          .asFunction<void Function(ffi.Pointer<LrmMidiIn>)>();
+
   /// Check if input is connected
   bool lrm_midi_in_is_connected(ffi.Pointer<LrmMidiIn> midi_in) {
     return _lrm_midi_in_is_connected(midi_in);
@@ -341,6 +363,18 @@ class LibremidiFlutterBindings {
       _lrm_midi_out_closePtr
           .asFunction<void Function(ffi.Pointer<LrmMidiOut>)>();
 
+  void lrm_midi_out_close_deferred(ffi.Pointer<LrmMidiOut> midi_out) {
+    return _lrm_midi_out_close_deferred(midi_out);
+  }
+
+  late final _lrm_midi_out_close_deferredPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmMidiOut>)>>(
+        'lrm_midi_out_close_deferred',
+      );
+  late final _lrm_midi_out_close_deferred =
+      _lrm_midi_out_close_deferredPtr
+          .asFunction<void Function(ffi.Pointer<LrmMidiOut>)>();
+
   /// Check if output is connected
   bool lrm_midi_out_is_connected(ffi.Pointer<LrmMidiOut> midi_out) {
     return _lrm_midi_out_is_connected(midi_out);
@@ -457,6 +491,18 @@ class LibremidiFlutterBindings {
       );
   late final _lrm_observer_free =
       _lrm_observer_freePtr
+          .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
+
+  void lrm_observer_free_deferred(ffi.Pointer<LrmObserver> observer) {
+    return _lrm_observer_free_deferred(observer);
+  }
+
+  late final _lrm_observer_free_deferredPtr =
+      _lookup<ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmObserver>)>>(
+        'lrm_observer_free_deferred',
+      );
+  late final _lrm_observer_free_deferred =
+      _lrm_observer_free_deferredPtr
           .asFunction<void Function(ffi.Pointer<LrmObserver>)>();
 
   /// Get input port info by index (returns 0 on success, fills info struct)
@@ -668,6 +714,17 @@ class LibremidiFlutterBindings {
   >('lrm_open_ticket_release');
   late final _lrm_open_ticket_release =
       _lrm_open_ticket_releasePtr
+          .asFunction<void Function(ffi.Pointer<LrmOpenTicket>)>();
+
+  void lrm_open_ticket_release_deferred(ffi.Pointer<LrmOpenTicket> ticket) {
+    return _lrm_open_ticket_release_deferred(ticket);
+  }
+
+  late final _lrm_open_ticket_release_deferredPtr = _lookup<
+    ffi.NativeFunction<ffi.Void Function(ffi.Pointer<LrmOpenTicket>)>
+  >('lrm_open_ticket_release_deferred');
+  late final _lrm_open_ticket_release_deferred =
+      _lrm_open_ticket_release_deferredPtr
           .asFunction<void Function(ffi.Pointer<LrmOpenTicket>)>();
 
   /// After the done message: the opened LrmMidiIn* / LrmMidiOut* (ownership

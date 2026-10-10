@@ -20,6 +20,8 @@
 #include <cstring>
 #include <condition_variable>
 #include <memory>
+#include <functional>
+#include <deque>
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -31,6 +33,8 @@ struct DartPortSink {
     LrmPostCObject post;
     int64_t port;
 };
+static void post_midi_to_port(void* context, const uint8_t* data, size_t length,
+                              int64_t timestamp);
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
@@ -533,10 +537,16 @@ struct LrmMidiIn {
                 return;
             // libremidi reuses a single message buffer: it is cleared as soon as
             // this synchronous callback returns and overwritten for every further
-            // message in the same packet. The Dart side is a
-            // NativeCallable.listener that reads the bytes later on the event
-            // loop, so hand it an owning heap copy and let it release the copy
-            // via lrm_free once it has been read.
+            // message in the same packet. Port delivery copies the bytes into
+            // the Dart heap inside the post, i.e. before that, so it reads the
+            // buffer directly.
+            if (callback == post_midi_to_port) {
+                post_midi_to_port(context, msg.bytes.data(), size, msg.timestamp);
+                return;
+            }
+            // A plain LrmMidiCallback may read the bytes later (a Dart
+            // NativeCallable.listener does), so it gets an owning heap copy,
+            // released via lrm_free once read.
             auto* copy = claim_message_buffer(size, this);
             if (!copy)
                 return;
@@ -654,10 +664,9 @@ static void post_midi_to_port(void* context, const uint8_t* data, size_t length,
     message.type = Dart_CObject_kArray;
     message.value.as_array.length = 2;
     message.value.as_array.values = items;
-    // The post copies the bytes into the Dart heap, so the buffer the callback
-    // path allocated for them can go right away.
+    // The post copies the bytes into the Dart heap; `data` is libremidi's own
+    // buffer and stays with it (see LrmMidiIn's on_message).
     sink->post(sink->port, &message);
-    lrm_free(const_cast<uint8_t*>(data));
 }
 
 // =============================================================================
@@ -1005,8 +1014,8 @@ struct OpenErrorScope {
     void set(const char*) {}
 };
 
-static std::string current_open_error() {
-    return {};
+static const char* current_open_error() {
+    return "";
 }
 
 // Resolve a port id against the observer for the asynchronous open.
@@ -1161,4 +1170,79 @@ extern "C" FFI_PLUGIN_EXPORT const char* lrm_open_ticket_error(LrmOpenTicket* ti
 
 extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release(LrmOpenTicket* ticket) {
     if (ticket) release_open_ticket(ticket);
+}
+
+// =============================================================================
+// Deferred release
+// =============================================================================
+//
+// See the header. One cleanup thread, started on first use, works through the
+// queue for the rest of the process. The queue itself is never destroyed, so
+// a finalizer that runs while the process is exiting cannot touch a dead
+// object. Must stay in sync with the other native copy.
+namespace {
+class DeferredReleaser {
+public:
+    void post(std::function<void()> release) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(std::move(release));
+            if (!started_) {
+                started_ = true;
+                std::thread([this] { run(); }).detach();
+            }
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> release;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !queue_.empty(); });
+                release = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            release();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> queue_;
+    bool started_ = false;
+};
+
+DeferredReleaser& deferred_releaser() {
+    static auto* releaser = new DeferredReleaser();  // intentionally never freed
+    return *releaser;
+}
+
+template <typename T>
+void release_later(T* object, void (*release)(T*)) {
+    if (!object) return;
+    try {
+        deferred_releaser().post([object, release] { release(object); });
+    } catch (...) {
+        release(object);  // out of memory: better to block than to leak
+    }
+}
+}  // namespace
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_midi_in_close_deferred(LrmMidiIn* midi_in) {
+    release_later(midi_in, lrm_midi_in_close);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_midi_out_close_deferred(LrmMidiOut* midi_out) {
+    release_later(midi_out, lrm_midi_out_close);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_observer_free_deferred(LrmObserver* observer) {
+    release_later(observer, lrm_observer_free);
+}
+
+extern "C" FFI_PLUGIN_EXPORT void lrm_open_ticket_release_deferred(LrmOpenTicket* ticket) {
+    release_later(ticket, lrm_open_ticket_release);
 }
