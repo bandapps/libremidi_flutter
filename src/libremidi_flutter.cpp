@@ -23,6 +23,22 @@
 
 #include <libremidi/libremidi.hpp>
 #include <libremidi/port_comparison.hpp>
+
+// Guard: the patched cmidi2 copy must be the one that gets included.
+//
+// src/libremidi/cmidi2.hpp fixes two defects that only MIDI 2.0 backends hit —
+// a conversion loop that never terminates on a SysEx of exactly 256 bytes, and
+// a SysEx7 reassembly buffer that cannot span calls. It takes effect purely
+// through header search order: `src` must come before `third_party`. If that
+// order is ever reversed, or libremidi is updated without carrying the patch
+// forward, the unpatched upstream header is used and nothing looks wrong — the
+// failure first shows up as a frozen app in someone's hands. So fail here,
+// loudly, at build time. CMIDI2_SYSEX7_BUFFER_SIZE exists only in the copy.
+#include <libremidi/cmidi2.hpp>
+#if !defined(CMIDI2_SYSEX7_BUFFER_SIZE)
+  #error "Unpatched cmidi2 header in use: <libremidi/cmidi2.hpp> resolved to third_party instead of src/libremidi/cmidi2.hpp. Put src ahead of third_party/libremidi/include in the include path (CMake: target_include_directories in src/CMakeLists.txt; Apple: both podspecs plus the patched_libremidi symlink in each Package.swift). Building against the unpatched header means a 256-byte SysEx hangs the sending thread and received SysEx messages are truncated to their final packet."
+#endif
+
 #include <dart_api/dart_native_api.h>
 #include <lrm_transport.hpp>
 
