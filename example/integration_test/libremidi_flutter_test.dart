@@ -21,16 +21,40 @@ MidiPort? safeTestInput(MidiObserver observer) {
   return null;
 }
 
-/// An input and an output of the same virtual loopback device, or null.
+/// An input and an output that echo into each other, or null.
 ///
-/// Same display name is the criterion on most platforms (the macOS IAC bus).
-/// On Android, several identical virtual devices can be installed, so the two
-/// ports must also belong to the same device: the port id carries the device
-/// id in its upper 32 bits there.
+/// Two shapes exist, and picking the wrong one yields a pair that never
+/// delivers — the test then fails instead of skipping, which is worse than
+/// having no loopback at all.
+///
+/// Windows MIDI Services loopbacks are *pairs*: what is sent to endpoint A is
+/// received by B and vice versa, never by the sender itself. Both ends carry
+/// the same association id in [MidiPort.serial] and differ by display name, so
+/// they must be paired across the two names. Transport `loopback` identifies
+/// them.
+///
+/// Everywhere else the same device echoes onto itself (the macOS IAC bus, a
+/// loopback MidiDeviceService app on Android), so equal display names are the
+/// criterion. On Android several identical virtual devices can be installed,
+/// so the two ports must also belong to the same device: the port id carries
+/// the device id in its upper 32 bits there.
 (MidiPort, MidiPort)? virtualLoopbackPair(
   List<MidiPort> inputs,
   List<MidiPort> outputs,
 ) {
+  bool isPairedLoopback(MidiPort p) =>
+      p.isVirtual && p.transportType == MidiTransportType.loopback;
+
+  for (final i in inputs.where(isPairedLoopback)) {
+    for (final o in outputs.where(isPairedLoopback)) {
+      if (i.serial.isNotEmpty &&
+          o.serial == i.serial &&
+          o.displayName != i.displayName) {
+        return (i, o);
+      }
+    }
+  }
+
   for (final i in inputs.where((p) => p.isVirtual)) {
     for (final o in outputs.where((p) => p.isVirtual)) {
       final sameDevice = !Platform.isAndroid || (i.portId >> 32) == (o.portId >> 32);
@@ -452,6 +476,69 @@ void main() {
           final dump = received.where((m) => m.isSysEx).toList();
           expect(dump, hasLength(1));
           expect(dump.single.data, sysex);
+        } finally {
+          await sub.cancel();
+          input.dispose();
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    // A 256-byte SysEx used to hang the sending thread outright. The MIDI 1 to
+    // UMP converter tracked both stream offsets through uint8_t pointers onto
+    // size_t fields, so every offset wrapped at 256: at exactly 256 bytes the
+    // source index returned to 0 and the conversion loop never terminated,
+    // above that it wrapped into the SysEx payload and the send failed. Only
+    // MIDI 2.0 backends run that converter, so a UMP transport (Windows MIDI
+    // Services) is what regresses; running it elsewhere costs nothing.
+    //
+    // The receive side had its own defect, exposed by the same transport: the
+    // SysEx7 reassembly buffer lived on the stack of the UMP-to-MIDI-1
+    // converter, so with one UMP delivered per callback every packet but the
+    // last was dropped and the receiver got 0xF0 + <last packet> + 0xF7 — a
+    // short message that is indistinguishable from a complete one. Sizes here
+    // straddle 256 and run well past it, so a regression in either direction
+    // fails: a hang times the test out, a lost packet fails the comparison.
+    testWidgets('a SysEx across the 256-byte conversion boundary round-trips',
+        (tester) async {
+      final observer = MidiObserver();
+      try {
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final inPort = pair?.$1;
+        final outPort = pair?.$2;
+        if (inPort == null || outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        final input = observer.openInput(inPort);
+        final output = observer.openOutput(outPort);
+        final received = <MidiMessage>[];
+        final sub = input.messages.listen(received.add);
+        try {
+          for (final total in [255, 256, 257, 600, 1200]) {
+            received.clear();
+            final message = MidiMessageBuilder.sysEx(
+              Uint8List.fromList([for (var i = 0; i < total - 2; i++) i & 0x7F]),
+            );
+            expect(message, hasLength(total));
+            expect(() => output.send(message), returnsNormally,
+                reason: 'sending a $total-byte SysEx must not throw');
+
+            for (var i = 0; i < 50 && !received.any((m) => m.isSysEx); i++) {
+              await tester.runAsync(
+                () => Future<void>.delayed(const Duration(milliseconds: 40)),
+              );
+            }
+            final dump = received.where((m) => m.isSysEx).toList();
+            expect(dump, hasLength(1),
+                reason: 'a $total-byte SysEx must arrive as one message');
+            expect(dump.single.data, message,
+                reason: 'a $total-byte SysEx must arrive byte for byte');
+          }
         } finally {
           await sub.cancel();
           input.dispose();
