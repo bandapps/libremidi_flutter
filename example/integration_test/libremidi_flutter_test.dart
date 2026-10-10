@@ -42,6 +42,30 @@ MidiPort? safeTestInput(MidiObserver observer) {
   List<MidiPort> inputs,
   List<MidiPort> outputs,
 ) {
+  final paired = wmsLoopbackPair(inputs, outputs);
+  if (paired != null) return paired;
+
+  for (final i in inputs.where((p) => p.isVirtual)) {
+    for (final o in outputs.where((p) => p.isVirtual)) {
+      final sameDevice = !Platform.isAndroid || (i.portId >> 32) == (o.portId >> 32);
+      if (o.displayName == i.displayName && sameDevice) return (i, o);
+    }
+  }
+  return null;
+}
+
+/// A Windows MIDI Services loopback pair (see [virtualLoopbackPair]), or null.
+///
+/// Its presence means the MIDI 2.0 backend is active, and only there does a
+/// send pass through the MIDI 1 to UMP converter: libremidi picks that backend
+/// only on Windows with Windows MIDI Services running. Tests of the converter's
+/// limits need this pair, not just any loopback — on the MIDI 1 backends the
+/// same sends are governed by other rules (CoreMIDI takes one message per send
+/// and accepts a 60 KB SysEx), so the expectations would not hold there.
+(MidiPort, MidiPort)? wmsLoopbackPair(
+  List<MidiPort> inputs,
+  List<MidiPort> outputs,
+) {
   bool isPairedLoopback(MidiPort p) =>
       p.isVirtual && p.transportType == MidiTransportType.loopback;
 
@@ -52,13 +76,6 @@ MidiPort? safeTestInput(MidiObserver observer) {
           o.displayName != i.displayName) {
         return (i, o);
       }
-    }
-  }
-
-  for (final i in inputs.where((p) => p.isVirtual)) {
-    for (final o in outputs.where((p) => p.isVirtual)) {
-      final sameDevice = !Platform.isAndroid || (i.portId >> 32) == (o.portId >> 32);
-      if (o.displayName == i.displayName && sameDevice) return (i, o);
     }
   }
   return null;
@@ -592,12 +609,13 @@ void main() {
     testWidgets('two messages in one send buffer both arrive', (tester) async {
       final observer = MidiObserver();
       try {
-        final pair = virtualLoopbackPair(
+        final pair = wmsLoopbackPair(
             observer.getInputPorts(), observer.getOutputPorts());
         final inPort = pair?.$1;
         final outPort = pair?.$2;
         if (inPort == null || outPort == null) {
-          markTestSkipped('no virtual loopback port pair available');
+          markTestSkipped('converter path only: needs a Windows MIDI Services '
+              'loopback pair');
           return;
         }
 
@@ -644,11 +662,12 @@ void main() {
         'buffer', (tester) async {
       final observer = MidiObserver();
       try {
-        final pair = virtualLoopbackPair(
+        final pair = wmsLoopbackPair(
             observer.getInputPorts(), observer.getOutputPorts());
         final outPort = pair?.$2;
         if (outPort == null) {
-          markTestSkipped('no virtual loopback port pair available');
+          markTestSkipped('converter path only: needs a Windows MIDI Services '
+              'loopback pair');
           return;
         }
 
@@ -686,11 +705,12 @@ void main() {
         'past the buffer', (tester) async {
       final observer = MidiObserver();
       try {
-        final pair = virtualLoopbackPair(
+        final pair = wmsLoopbackPair(
             observer.getInputPorts(), observer.getOutputPorts());
         final outPort = pair?.$2;
         if (outPort == null) {
-          markTestSkipped('no virtual loopback port pair available');
+          markTestSkipped('converter path only: needs a Windows MIDI Services '
+              'loopback pair');
           return;
         }
 
