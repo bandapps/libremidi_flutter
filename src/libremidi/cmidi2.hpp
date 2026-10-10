@@ -67,10 +67,21 @@
 // Keep `src` ahead of `third_party` in the header search order or this copy is
 // silently bypassed and both defects return.
 //
-// NOT fixed here, reported upstream-worthy but untested: a few lines below the
-// patch, `sysExCtx.dst_offset = *dIdx` seeds a uint32_t *word* index from a
-// *byte* counter. Harmless for a single message starting at offset 0 — which is
-// how this plugin sends — wrong for several messages in one buffer.
+// ---------------------------------------------------------------------------
+// 3. Word index seeded from a byte counter, and a bounds check in the wrong
+//    unit (send direction)
+// ---------------------------------------------------------------------------
+//
+// In the same SysEx branch, `sysExCtx.dst_offset = *dIdx` seeds an index into
+// context->ump — an array of uint32_t — from a byte counter, so it is four
+// times too large for any message that follows another in the same buffer.
+// lrm_midi_out_send() takes an arbitrary byte range, so a caller may well put
+// two messages in one call.
+//
+// Next to it, `if (dLen - *dIdx < numPackets)` compares bytes remaining against
+// a packet count. A SysEx7 packet occupies eight bytes, so the check passed
+// with eight times too little room and a payload beyond roughly 48 KiB — a
+// sample dump, say — wrote past the end of the buffer.
 #ifndef CMIDI2_H_INCLUDED
 #define CMIDI2_H_INCLUDED
 
@@ -2808,11 +2819,23 @@ cmidi2_convert_midi1_to_ump(cmidi2_midi_conversion_context* context)
       size_t sysexSize = f7 - context->midi1 - *sIdx - 1; // excluding 0xF7
       size_t numPackets = context->use_sysex8 ? cmidi2_ump_sysex8_get_num_packets(sysexSize)
                                               : cmidi2_ump_sysex7_get_num_packets(sysexSize);
-      if (dLen - *dIdx < numPackets)
+      // PATCHED: upstream compares a byte count against a packet count, so the
+      // check passes with nowhere near enough room. A SysEx7 packet is two
+      // uint32_t and a SysEx8 packet four, and the callbacks below write them
+      // straight into context->ump, so a payload beyond roughly 48 KiB ran past
+      // the end of that buffer.
+      const size_t wordsPerPacket = context->use_sysex8 ? 4u : 2u;
+      if ((dLen - *dIdx) / sizeof(cmidi2_ump) < numPackets * wordsPerPacket)
         return CMIDI2_CONVERSION_RESULT_OUT_OF_SPACE;
       cmidi2_convert_sysex_context sysExCtx;
       sysExCtx.conversion_context = context;
-      sysExCtx.dst_offset = *dIdx;
+      // PATCHED: dst_offset indexes context->ump, which is uint32_t, while
+      // *dIdx counts bytes. The two agree only while the message starts at
+      // offset 0 — which is how this plugin sends today — and the index is four
+      // times too large for anything that follows another message in the same
+      // buffer. lrm_midi_out_send() takes an arbitrary byte range, so a caller
+      // is free to put two messages in one call.
+      sysExCtx.dst_offset = *dIdx / sizeof(cmidi2_ump);
       if (context->use_sysex8)
       {
         // ignoring the return code as it never returns non-NULL... (size is already verified)

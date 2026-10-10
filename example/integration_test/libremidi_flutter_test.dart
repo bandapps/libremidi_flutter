@@ -67,6 +67,40 @@ MidiPort? safeTestInput(MidiObserver observer) {
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
+  // Several of the tests below need a virtual loopback pair and skip without
+  // one. A skip is easy to overlook — the run still ends in "All tests
+  // passed!" — and that is how the SysEx conversion bugs survived: on Windows
+  // the three loopback tests had been skipping unnoticed. This one states
+  // plainly whether that coverage is in effect.
+  testWidgets('loopback-backed coverage is enabled', (tester) async {
+    final observer = MidiObserver();
+    try {
+      final pair = virtualLoopbackPair(
+          observer.getInputPorts(), observer.getOutputPorts());
+      if (pair != null) {
+        return; // coverage is live
+      }
+      // ignore: avoid_print
+      print('''
+
+  ============================================================
+   NO VIRTUAL LOOPBACK PAIR - message delivery is NOT covered
+  ============================================================
+   Everything that sends a message and checks what arrives is
+   being skipped, including the SysEx conversion regressions.
+   A green run here says nothing about those paths.
+
+   macOS   enable the IAC Driver in Audio MIDI Setup
+   Windows see tool/midi_loopback/README.md
+  ============================================================
+''');
+      markTestSkipped(
+          'no virtual loopback pair - see tool/midi_loopback/README.md');
+    } finally {
+      observer.dispose();
+    }
+  });
+
   // =========================================================================
   // Native library loading
   // =========================================================================
@@ -542,6 +576,100 @@ void main() {
         } finally {
           await sub.cancel();
           input.dispose();
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    // send() takes a byte range, not a message, so a caller may put several
+    // messages in one call. The MIDI 1 to UMP converter seeded its destination
+    // index — which counts uint32_t — from a byte counter, so anything after
+    // the first message landed four times too far into the output buffer. A
+    // lone message starting at offset zero hides it, which is every message
+    // this example sends.
+    testWidgets('two messages in one send buffer both arrive', (tester) async {
+      final observer = MidiObserver();
+      try {
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final inPort = pair?.$1;
+        final outPort = pair?.$2;
+        if (inPort == null || outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        final input = observer.openInput(inPort);
+        final output = observer.openOutput(outPort);
+        final received = <MidiMessage>[];
+        final sub = input.messages.listen(received.add);
+        try {
+          final note =
+              MidiMessageBuilder.noteOn(channel: 3, note: 70, velocity: 88);
+          final sysex = MidiMessageBuilder.sysEx(
+            Uint8List.fromList([0x7D, for (var i = 0; i < 40; i++) i & 0x7F]),
+          );
+          output.send(Uint8List.fromList([...note, ...sysex]));
+
+          for (var i = 0; i < 40 && received.length < 2; i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 40)),
+            );
+          }
+          final notes = received.where((m) => m.isNoteOn).toList();
+          expect(notes, hasLength(1), reason: 'the leading note must arrive');
+          expect([notes.single.channel, notes.single.note,
+              notes.single.velocity], [3, 70, 88]);
+          final dumps = received.where((m) => m.isSysEx).toList();
+          expect(dumps, hasLength(1),
+              reason: 'the SysEx following it must arrive too');
+          expect(dumps.single.data, sysex);
+        } finally {
+          await sub.cancel();
+          input.dispose();
+          output.dispose();
+        }
+      } finally {
+        observer.dispose();
+      }
+    });
+
+    // The converter writes SysEx packets into a fixed buffer and checked the
+    // remaining room in bytes against a count of packets, which are eight bytes
+    // each — so a payload past roughly 48 KiB wrote beyond the end of it. A
+    // message too large to convert has to be refused, not half-written.
+    testWidgets('a SysEx too large to convert is refused, not written past the '
+        'buffer', (tester) async {
+      final observer = MidiObserver();
+      try {
+        final pair = virtualLoopbackPair(
+            observer.getInputPorts(), observer.getOutputPorts());
+        final outPort = pair?.$2;
+        if (outPort == null) {
+          markTestSkipped('no virtual loopback port pair available');
+          return;
+        }
+
+        final output = observer.openOutput(outPort);
+        try {
+          final huge = MidiMessageBuilder.sysEx(
+            Uint8List.fromList([for (var i = 0; i < 60000; i++) i & 0x7F]),
+          );
+          expect(
+            () => output.send(huge),
+            throwsA(isA<MidiException>()),
+            reason: 'a SysEx beyond the converter buffer must fail cleanly',
+          );
+          // Still usable afterwards: the refusal must not leave the port or the
+          // converter in a broken state.
+          expect(
+            () => output.send(
+                MidiMessageBuilder.noteOn(channel: 0, note: 60, velocity: 1)),
+            returnsNormally,
+          );
+        } finally {
           output.dispose();
         }
       } finally {
