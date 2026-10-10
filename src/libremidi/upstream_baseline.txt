@@ -1,0 +1,38 @@
+# Classification of every file under src/libremidi/.
+#
+# This directory sits ahead of third_party on the include path, so each file
+# here either shadows a vendored libremidi header or is one of ours. Which of
+# the two it is has to be written down, because both get silently dangerous:
+#
+#   * A patched copy whose vendored original changes is a stale file shadowing
+#     a newer one — it reverts whatever upstream fixed, and still compiles.
+#   * A file of ours becomes a shadow the moment upstream adds that same path.
+#
+# Format, one line per file:
+#
+#   <fingerprint>  <path relative to src/libremidi/>   patched copy
+#   -              <path relative to src/libremidi/>   ours, no upstream
+#
+# The fingerprint is FNV-1a over the *vendored original*, line endings
+# normalised. test/patched_headers_test.dart checks it and prints the current
+# value when it differs.
+#
+# When it fails after a libremidi update: re-apply the local fix on top of the
+# new upstream file, confirm the patch notes at the top of the copy still
+# describe reality, verify, and only then record the new fingerprint. Updating
+# the number alone throws away the fix.
+
+6712b873a0075d04  backends/android/config.hpp
+044261f29c9c153e  backends/android/helpers.hpp
+ae9cec11220ab2ea  backends/android/midi_in.hpp
+0423f9726faee060  backends/android/midi_out.hpp
+4b154436e9e764b5  backends/android/observer.hpp
+7560f222210c7e59  backends/coremidi/midi_in.hpp
+f9cbe060e5e37df3  backends/winmidi/observer.hpp
+6a220e3829d739ce  backends/winuwp/observer.hpp
+837b6a50df1091b5  cmidi2.hpp
+
+# Ours, no upstream counterpart: a MIDI 1.0 byte-stream parser for the Android
+# input, which libremidi has no equivalent for. It lives here only because it
+# must be reachable as <libremidi/backends/android/stream_parser.hpp>.
+-  backends/android/stream_parser.hpp
