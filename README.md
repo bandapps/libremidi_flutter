@@ -255,7 +255,7 @@ input.messages.listen((msg) {
 print(port.product);      // Product name
 print(port.serial);       // Serial number
 print(port.isVirtual);    // true if software port
-print(port.isHardware);   // true if USB or hardware
+print(port.isHardware);   // true for USB, Bluetooth, PCI or other hardware
 print(port.isOutput);     // opposite of isInput
 
 // Export all port info as Map

@@ -137,6 +137,15 @@ enum MidiTransportType {
   pci,
   network;
 
+  /// Whether a raw transport value ([MidiPort.rawTransportType]) describes a
+  /// physical device: generic hardware, USB, Bluetooth or PCI.
+  ///
+  /// The value is a set of flags — a Bluetooth controller reports
+  /// hardware | bluetooth — so this tests bits rather than comparing with a
+  /// single [MidiTransportType], which only names the most specific flag.
+  static bool isHardwareValue(int value) =>
+      value & (8 | 16 | 32 | 64) != 0; // hardware | usb | bluetooth | pci
+
   static MidiTransportType fromValue(int value) {
     if (value & 128 != 0) return MidiTransportType.network;
     if (value & 64 != 0) return MidiTransportType.pci;
@@ -249,10 +258,9 @@ class MidiPort {
   /// Whether this is an output port.
   bool get isOutput => !isInput;
 
-  /// Whether this is a hardware port (USB or generic hardware).
-  bool get isHardware =>
-      transportType == MidiTransportType.hardware ||
-      transportType == MidiTransportType.usb;
+  /// Whether this is a physical device: USB, Bluetooth, PCI or other
+  /// hardware. See [MidiTransportType.isHardwareValue].
+  bool get isHardware => MidiTransportType.isHardwareValue(rawTransportType);
 
   /// Returns a stable identifier that's reliable for reconnection logic.
   ///

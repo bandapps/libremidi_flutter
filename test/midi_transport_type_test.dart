@@ -64,4 +64,25 @@ void main() {
       expect(MidiTransportType.network.displayName, 'Network');
     });
   });
+
+  // MidiPort.isHardware is built on this. It used to compare the single
+  // most-specific transport (fromValue) with hardware/usb, so a Bluetooth
+  // controller — hardware | bluetooth, which fromValue names "bluetooth" —
+  // was reported as not hardware.
+  group('MidiTransportType.isHardwareValue', () {
+    test('physical transports count as hardware, with or without the hardware bit',
+        () {
+      for (final value in [8, 16, 32, 64, 8 | 16, 8 | 32, 8 | 64]) {
+        expect(MidiTransportType.isHardwareValue(value), isTrue,
+            reason: 'value $value');
+      }
+    });
+
+    test('virtual, network and unknown transports do not', () {
+      for (final value in [0, 2, 4, 2 | 4, 128]) {
+        expect(MidiTransportType.isHardwareValue(value), isFalse,
+            reason: 'value $value');
+      }
+    });
+  });
 }
